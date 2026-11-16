@@ -1,0 +1,30 @@
+{
+  "name": "simplecue",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A calm, capable A/V cue workspace for live production.",
+  "scripts": {
+    "dev": "node --watch --env-file-if-exists=.env server.js",
+    "start": "node --env-file-if-exists=.env server.js",
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/*.test.js",
+    "test:browser": "playwright test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@vercel/blob": "^2.0.0",
+    "cookie-parser": "^1.4.7",
+    "express": "^5.1.0",
+    "multer": "^2.0.2",
+    "music-metadata": "^11.9.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.1.0",
+    "tailwindcss": "^4.1.0",
+    "esbuild": "^0.25.0",
+    "@playwright/test": "^1.56.0"
+  }
+}

@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f3f0e8" />
+    <meta
+      name="description"
+      content="SimpleCue — your sound, perfectly on cue. An audio and video workspace for live production."
+    />
+    <title>SimpleCue — Your show, on cue.</title>
+    <script>
+      try {
+        const p = JSON.parse(localStorage.getItem("simplecue-prefs") || "{}");
+        document.documentElement.dataset.theme = p.mode || "light";
+        if (/^#[0-9a-f]{6}$/i.test(p.accent || ""))
+          document.documentElement.style.setProperty("--accent", p.accent);
+      } catch {}
+    </script>
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div id="app" class="app-shell">
+      <header class="app-header flex items-center justify-between">
+        <a
+          class="brand flex items-center gap-3"
+          href="/"
+          aria-label="SimpleCue home"
+          ><span class="brand-mark" aria-hidden="true"
+            ><i></i><i></i><i></i><i></i><i></i></span
+          ><span
+            >Simple<span class="font-normal">Cue</span><sup>®</sup></span
+          ></a
+        >
+        <nav class="main-nav flex" aria-label="Workspace">
+          <button class="nav-tab active" data-tab="editor">
+            <span data-icon="sliders"></span>Editor
+            <span class="nav-short">& player</span></button
+          ><button class="nav-tab" data-tab="player">
+            <span data-icon="play"></span>Player</button
+          ><button class="nav-tab" data-tab="media">
+            <span data-icon="folder"></span>Media
+          </button>
+        </nav>
+        <div class="header-actions flex items-center gap-4">
+          <span id="save-status" class="save-status"
+            ><i></i> All changes saved</span
+          ><button
+            class="icon-button"
+            id="theme-toggle"
+            data-action="toggle-theme"
+            aria-label="Switch to dark mode"
+            title="Switch to dark mode"
+          >
+            <span data-icon="moon"></span></button
+          ><button
+            class="icon-button"
+            data-action="settings"
+            aria-label="Theme and keyboard settings"
+            title="Workspace settings"
+          >
+            <span data-icon="settings"></span></button
+          ><button class="avatar" data-action="account" title="Account">
+            A
+          </button>
+        </div>
+      </header>
+      <main id="main-content" tabindex="-1"></main>
+      <footer class="app-footer flex items-center justify-between">
+        <div class="flex items-center gap-5">
+          <span id="connection-status"
+            ><i class="status-dot"></i> Connecting…</span
+          ><span id="cache-status"
+            ><span data-icon="harddrive"></span> Local cache ready</span
+          >
+        </div>
+        <button class="text-button" data-action="shortcuts">
+          <span data-icon="keyboard"></span>Shortcuts
+        </button>
+      </footer>
+    </div>
+    <input
+      type="file"
+      id="upload-input"
+      accept="audio/*,video/*,.m3u,.m3u8"
+      multiple
+      hidden
+    />
+    <dialog id="modal"><div id="modal-content"></div></dialog>
+    <div
+      id="toast-region"
+      class="toast-region"
+      role="status"
+      aria-live="polite"
+    ></div>
+    <section id="login-screen" class="login-screen hidden" aria-label="Sign in">
+      <div class="login-art">
+        <a class="brand flex items-center gap-3" href="/"
+          ><span class="brand-mark"><i></i><i></i><i></i><i></i><i></i></span
+          ><span
+            >Simple<span class="font-normal">Cue</span><sup>®</sup></span
+          ></a
+        >
+        <div class="login-tagline">
+          <h2>A/V cue player</h2>
+          <p>Sequences, media, and production playback.</p>
+          <div class="login-wave" aria-hidden="true"></div>
+        </div>
+      </div>
+      <div class="login-form-wrap">
+        <form id="login-form">
+          <span class="section-kicker">SIMPLECUE</span>
+          <h2>Sign in</h2>
+          <p>Enter your username and password.</p>
+          <label
+            >Username<input
+              name="username"
+              autocomplete="username"
+              value="admin"
+              required /></label
+          ><label
+            >Password<input
+              name="password"
+              type="password"
+              autocomplete="current-password"
+              value="admin"
+              required
+          /></label>
+          <div id="login-error" role="alert"></div>
+          <button class="button button-dark w-full" type="submit">
+            Open workspace <span data-icon="arrow-right"></span>
+          </button>
+          <div class="default-account">
+            Prototype account <code>admin / admin</code>
+          </div>
+        </form>
+        <span class="login-version">SimpleCue <span>v1.0</span></span>
+      </div>
+    </section>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
