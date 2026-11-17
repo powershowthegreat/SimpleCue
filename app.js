@@ -13,10 +13,16 @@ import {
 import path from "node:path";
 import { randomUUID, randomBytes } from "node:crypto";
 import { parseBuffer, parseFile } from "music-metadata";
-import { handleUpload } from "@vercel/blob/client";
-import { head, del } from "@vercel/blob";
+import {
+  blobBucket,
+  serveBlobUpload,
+  finishBlobUpload,
+  writeSequenceBlob,
+  sequenceBlobPath,
+} from "./server/blob.js";
 import { store } from "./server/store.js";
 import { serialize, parse, validateSequence } from "./server/m3u.js";
+import { renameMediaFile } from "./public/media-name.js";
 import { demoMedia, demoSequences } from "./server/seed.js";
 
 const app = express(),
@@ -64,8 +70,12 @@ async function init() {
       if (!(await store.get("initialized"))) {
         for (const m of demoMedia) await store.put("media", m.id, m, true);
         const media = Object.fromEntries(demoMedia.map((m) => [m.id, m]));
-        for (const s of demoSequences)
-          await store.put("sequences", s.id, serialize(s, media), true);
+        for (const s of demoSequences) {
+          const text = serialize(s, media);
+          await store.put("sequences", s.id, text, true);
+          if (process.env.UPSTASH_BLOB_TOKEN)
+            await writeSequenceBlob(s.id, text);
+        }
         await store.set("initialized", true);
       }
     })().catch((e) => {
@@ -79,8 +89,8 @@ app.get("/api/health", async (req, res) => {
   res.json({
     ok: true,
     database: store.url ? "redis" : "local",
-    uploads: process.env.BLOB_READ_WRITE_TOKEN
-      ? "blob"
+    uploads: process.env.UPSTASH_BLOB_TOKEN
+      ? "upstash"
       : cloud
         ? "unconfigured"
         : "disk",
@@ -116,63 +126,9 @@ async function auth(req, res, next) {
   req.user = user;
   next();
 }
-// Blob callbacks carry a provider signature, validated by handleUpload. Token minting requires a session.
-app.post("/api/blob/upload", async (req, res) => {
-  if (!process.env.BLOB_READ_WRITE_TOKEN)
-    throw fail(
-      503,
-      "Connect a public Vercel Blob store and set BLOB_READ_WRITE_TOKEN to upload media in the cloud.",
-    );
-  const result = await handleUpload({
-    body: req.body,
-    request: req,
-    onBeforeGenerateToken: async (pathname, clientPayload) => {
-      const token = req.cookies.simplecue_session;
-      if (!token || !(await store.get(`session:${token}`)))
-        throw fail(401, "Sign in before uploading.");
-      const p = JSON.parse(clientPayload || "{}"),
-        ext = pathname.split(".").pop().toLowerCase();
-      if (!extensions.has(ext) || !/^media\/[\w-]+\.[\w]+$/.test(pathname))
-        throw fail(400, "Unsupported media file.");
-      const duration = Number(p.duration);
-      if (!Number.isFinite(duration) || duration <= 0)
-        throw fail(400, "Could not read the media duration.");
-      return {
-        allowedContentTypes: ["audio/*", "video/*", "application/octet-stream"],
-        maximumSizeInBytes: 500 * 1024 * 1024,
-        addRandomSuffix: true,
-        tokenPayload: JSON.stringify({
-          name: safe(p.name),
-          folder: safe(p.folder) || "Uploads",
-          duration,
-          filename: safe(p.filename),
-          id: pathname.split("/")[1].split(".")[0],
-          extension: ext.toUpperCase(),
-        }),
-      };
-    },
-    onUploadCompleted: async ({ blob, tokenPayload }) => {
-      await registerBlob(
-        { ...blob, ...(await head(blob.url)) },
-        JSON.parse(tokenPayload),
-      );
-    },
-  });
-  res.json(result);
-});
-async function registerBlob(blob, p) {
-  const m = {
-    ...p,
-    type: blob.contentType,
-    size: blob.size || 0,
-    url: blob.url,
-    createdAt: new Date().toISOString(),
-    storage: "blob",
-  };
-  await store.put("media", m.id, m);
-  return m;
-}
 app.use("/api", auth);
+app.get("/api/uploads/blob", serveBlobUpload);
+app.post("/api/uploads/blob", serveBlobUpload);
 app.get("/api/session", (req, res) => res.json(req.user));
 app.post("/api/logout", async (req, res) => {
   await store.del(`session:${req.cookies.simplecue_session}`);
@@ -187,8 +143,8 @@ app.get("/api/workspace", async (req, res) => {
     sequences: Object.values(raw).map((s) => parse(s, media)),
     preferences: await store.get(`preferences:${req.user.username}`),
     database: store.url ? "redis" : "local",
-    uploads: process.env.BLOB_READ_WRITE_TOKEN
-      ? "blob"
+    uploads: process.env.UPSTASH_BLOB_TOKEN
+      ? "upstash"
       : cloud
         ? "unconfigured"
         : "disk",
@@ -208,6 +164,7 @@ async function saveSequence(input, id) {
       updatedAt: new Date().toISOString(),
     };
   const text = serialize(seq, media);
+  if (process.env.UPSTASH_BLOB_TOKEN) await writeSequenceBlob(id, text);
   await store.put("sequences", id, text);
   if (!cloud) {
     await mkdir(path.join(dataDir, "sequences"), { recursive: true });
@@ -215,15 +172,20 @@ async function saveSequence(input, id) {
   }
   return seq;
 }
-app.post("/api/sequences", async (req, res) =>
-  res.status(201).json(await saveSequence(req.body, randomUUID())),
-);
+app.post("/api/sequences", async (req, res) => {
+  const clientId = req.body.clientId;
+  if (clientId !== undefined && !/^[0-9a-f-]{36}$/.test(clientId))
+    throw fail(400, "Invalid client sequence ID.");
+  res.status(201).json(await saveSequence(req.body, clientId || randomUUID()));
+});
 app.put("/api/sequences/:id", async (req, res) => {
   if (!(req.params.id in (await store.all("sequences"))))
     throw fail(404, "Sequence not found.");
   res.json(await saveSequence(req.body, req.params.id));
 });
 app.delete("/api/sequences/:id", async (req, res) => {
+  if (process.env.UPSTASH_BLOB_TOKEN)
+    await blobBucket().del(sequenceBlobPath(req.params.id));
   await store.remove("sequences", req.params.id);
   if (!cloud && /^[\w-]+$/.test(req.params.id))
     await unlink(path.join(dataDir, "sequences", `${req.params.id}.m3u`)).catch(
@@ -257,8 +219,10 @@ const rawChunk = express.raw({
   limit: "3mb",
 });
 function localUploads(req, res, next) {
-  if (cloud || process.env.BLOB_READ_WRITE_TOKEN)
-    return next(fail(400, "Use direct Blob uploads in this environment."));
+  if (cloud || process.env.UPSTASH_BLOB_TOKEN)
+    return next(
+      fail(400, "Use direct Upstash Blob uploads in this environment."),
+    );
   next();
 }
 const pendingPath = (id, ext) => {
@@ -370,8 +334,10 @@ app.delete("/api/uploads/:id", localUploads, async (req, res) => {
 app.post(
   "/api/media",
   (req, res, next) => {
-    if (cloud || process.env.BLOB_READ_WRITE_TOKEN)
-      return next(fail(400, "Use direct Blob uploads in this environment."));
+    if (cloud || process.env.UPSTASH_BLOB_TOKEN)
+      return next(
+        fail(400, "Use direct Upstash Blob uploads in this environment."),
+      );
     next();
   },
   upload.single("file"),
@@ -421,40 +387,19 @@ app.post(
     res.status(201).json(m);
   },
 );
-app.post("/api/media/blob-complete", async (req, res) => {
-  const { url, pathname, metadata } = req.body;
-  if (!process.env.BLOB_READ_WRITE_TOKEN)
-    throw fail(503, "Blob is not configured.");
-  const info = await head(url); // head validates that the URL belongs to this store.
-  if (info.pathname !== pathname || !/^media\/[\w-]+\.[\w]+$/.test(pathname))
-    throw fail(400, "Invalid upload receipt.");
-  // Use the caller-generated UUID; randomized Blob suffixes are after the original UUID.
-  const originalId = pathname.slice(6, 42);
-  if (!/^[0-9a-f-]{36}$/.test(originalId)) throw fail(400, "Invalid media ID.");
-  const old = (await store.all("media"))[originalId];
-  if (old) return res.json(old);
-  const duration = Number(metadata.duration);
-  if (!Number.isFinite(duration) || duration <= 0)
-    throw fail(400, "Invalid duration.");
-  res
-    .status(201)
-    .json(
-      await registerBlob(
-        { ...info, url },
-        {
-          id: originalId,
-          name: safe(metadata.name),
-          folder: safe(metadata.folder) || "Uploads",
-          duration,
-          filename: safe(metadata.filename),
-          extension: pathname.split(".").pop().toUpperCase(),
-        },
-      ),
-    );
+app.post("/api/media/upstash-complete", async (req, res) => {
+  res.json(await finishBlobUpload(String(req.body.path || ""), req.user));
 });
 app.get("/api/media/:id/file", async (req, res) => {
   const m = (await store.all("media"))[req.params.id];
   if (!m) throw fail(404, "Media not found.");
+  if (m.storage === "upstash") {
+    const link = await blobBucket().signedReadUrl(m.blobPath, {
+      expiresIn: "10m",
+      contentType: m.type,
+    });
+    return res.set("Cache-Control", "private, no-store").redirect(link.url);
+  }
   if (m.storage === "disk")
     return res.sendFile(
       path.join(dataDir, "uploads", path.basename(m.storedFilename)),
@@ -462,12 +407,45 @@ app.get("/api/media/:id/file", async (req, res) => {
   res.redirect(m.url);
 });
 app.patch("/api/media/:id", async (req, res) => {
-  const m = (await store.all("media"))[req.params.id];
+  const all = await store.all("media"),
+    m = all[req.params.id];
   if (!m) throw fail(404, "Media not found.");
-  m.name = safe(req.body.name) || m.name;
-  m.folder = safe(req.body.folder) || m.folder;
-  m.description = String(req.body.description || "").slice(0, 1000);
+  if (req.body.filename !== undefined)
+    Object.assign(m, renameMediaFile(m, req.body.filename));
+  else if (req.body.name !== undefined) m.name = safe(req.body.name) || m.name;
+  if (req.body.folder !== undefined)
+    m.folder = safe(req.body.folder) || m.folder;
+  if (req.body.description !== undefined)
+    m.description = String(req.body.description || "").slice(0, 1000);
+  m.updatedAt = new Date().toISOString();
   await store.put("media", m.id, m);
+  // Rewrite playlist references while retaining cue IDs, settings and immutable storage paths.
+  if (req.body.name !== undefined || req.body.filename !== undefined)
+    for (const [id, text] of Object.entries(await store.all("sequences"))) {
+      let seq;
+      try {
+        seq = parse(text, all);
+      } catch {
+        // Leave already-invalid playlists intact. Old filenames remain valid aliases.
+        continue;
+      }
+      if (seq.cues.some((c) => c.mediaId === m.id)) {
+        seq.cues.forEach((c) => {
+          if (c.mediaId === m.id) c.name = m.name;
+        });
+        const nextText = serialize(seq, all);
+        if (process.env.UPSTASH_BLOB_TOKEN)
+          await writeSequenceBlob(id, nextText);
+        await store.put("sequences", id, nextText);
+        if (!cloud) {
+          await mkdir(path.join(dataDir, "sequences"), { recursive: true });
+          await writeFile(
+            path.join(dataDir, "sequences", `${id}.m3u`),
+            nextText,
+          );
+        }
+      }
+    }
   res.json(m);
 });
 app.delete("/api/media/:id", async (req, res) => {
@@ -479,7 +457,12 @@ app.delete("/api/media/:id", async (req, res) => {
   );
   if (used)
     throw fail(409, "Remove this media from its sequences before deleting it.");
-  if (m.storage === "blob") await del(m.url);
+  if (m.storage === "upstash") await blobBucket().del(m.blobPath);
+  if (m.storage === "blob")
+    throw fail(
+      409,
+      "Migrate this legacy upload to Upstash Blob before deleting it.",
+    );
   if (m.storage === "disk")
     await unlink(
       path.join(dataDir, "uploads", path.basename(m.storedFilename)),

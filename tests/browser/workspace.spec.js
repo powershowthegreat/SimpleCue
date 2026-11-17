@@ -515,6 +515,7 @@ test("cue configuration persists loops and next linkage, and direct header actio
     .click();
   await page.locator("#cue-loop-mode").selectOption("forever");
   await page.getByRole("button", { name: "Save configuration" }).click();
+  await expect(page.locator("#modal")).not.toBeVisible();
   await page.reload();
   await expect(source().locator(".cue-modifiers")).toHaveText(
     "loop forever | autoplay next",
@@ -741,4 +742,478 @@ test("Ctrl/Cmd S commits focused edits, saves to server and refreshes existing c
   ).toBeVisible();
   expect(await cached()).toBe(null);
   await page.request.delete("/api/sequences/" + created.id);
+});
+
+test("cue words persist beside file types and clicking a track selects it without autoplay", async ({
+  page,
+}) => {
+  await signIn(page);
+  const ws = await (await page.request.get("/api/workspace")).json(),
+    m = ws.media[0];
+  const seq = await (
+    await page.request.post("/api/sequences", {
+      data: {
+        name: "Cue word QA",
+        cues: [
+          {
+            id: "cue-word-a",
+            mediaId: m.id,
+            start: 0,
+            end: 6,
+            volume: 100,
+            speed: 1,
+          },
+          {
+            id: "cue-word-b",
+            mediaId: m.id,
+            start: 2,
+            end: 8,
+            volume: 100,
+            speed: 1,
+          },
+        ],
+      },
+    })
+  ).json();
+  await page.reload();
+  await page
+    .locator(".sequence-tile")
+    .filter({ hasText: "Cue word QA" })
+    .click();
+  await page.locator(".cue-card").nth(1).locator(".cue-name").click();
+  await expect(page.locator(".active-cue")).toHaveAttribute("data-index", "1");
+  expect(await page.locator("body > video").evaluate((el) => el.paused)).toBe(
+    true,
+  );
+  const word = page.getByRole("textbox", { name: "Cue word for cue 1" });
+  await word.fill("Stand by… GO");
+  await page.keyboard.press("Control+s");
+  await expect(
+    page.getByText("Saved to server.", { exact: true }),
+  ).toBeVisible();
+  const text = await (
+    await page.request.get(`/api/sequences/${seq.id}/download`)
+  ).text();
+  expect(text).toContain("Stand by… GO");
+  await page.locator('[data-tab="player"]').click();
+  const box = page.locator(".cue-card").first().locator("strong.cue-word");
+  await expect(box).toHaveText("Stand by… GO");
+  expect(
+    Number(await box.evaluate((el) => getComputedStyle(el).fontWeight)),
+  ).toBeGreaterThanOrEqual(700);
+  await box.click();
+  await expect(page.locator(".active-cue")).toHaveAttribute("data-index", "0");
+  expect(await page.locator("body > video").evaluate((el) => el.paused)).toBe(
+    true,
+  );
+  await page.reload();
+  await expect(
+    page.getByRole("textbox", { name: "Cue word for cue 1" }),
+  ).toHaveValue("Stand by… GO");
+  await page.request.delete("/api/sequences/" + seq.id);
+});
+
+test("fade in, natural fade out, pause and stop ramp the audible output and preserve crop positions", async ({
+  page,
+}) => {
+  await signIn(page);
+  const ws = await (await page.request.get("/api/workspace")).json(),
+    m = ws.media[0];
+  const seq = await (
+    await page.request.post("/api/sequences", {
+      data: {
+        name: "Fade QA",
+        cues: [
+          {
+            id: "fade-a",
+            mediaId: m.id,
+            start: 1,
+            end: 12,
+            volume: 100,
+            speed: 1,
+            fadeIn: 1.2,
+            fadeOut: 0.6,
+          },
+          {
+            id: "fade-b",
+            mediaId: m.id,
+            start: 2,
+            end: 8,
+            volume: 100,
+            speed: 1,
+          },
+        ],
+      },
+    })
+  ).json();
+  await page.reload();
+  await page.locator(".sequence-tile").filter({ hasText: "Fade QA" }).click();
+  const source = () => page.locator(".cue-card").first();
+  await source().locator('[data-action="play-cue"]').click();
+  await page.waitForFunction(
+    () =>
+      !document.querySelector("body > video").paused &&
+      document.querySelector("audio[data-simplecue-output]").srcObject,
+  );
+  await page.evaluate(async () => {
+    const output = document.querySelector("audio[data-simplecue-output]"),
+      ctx = new AudioContext(),
+      source = ctx.createMediaStreamSource(output.srcObject),
+      meter = ctx.createAnalyser(),
+      silent = ctx.createGain();
+    meter.fftSize = 1024;
+    silent.gain.value = 0;
+    source.connect(meter);
+    meter.connect(silent);
+    silent.connect(ctx.destination);
+    await ctx.resume();
+    window.fadeMeter = ctx;
+    window.fadeRms = () => {
+      const a = new Float32Array(meter.fftSize);
+      meter.getFloatTimeDomainData(a);
+      return Math.sqrt(a.reduce((sum, n) => sum + n * n, 0) / a.length);
+    };
+  });
+  await page.waitForTimeout(250);
+  const early = await page.evaluate(() => window.fadeRms());
+  await page.waitForFunction(
+    () => document.querySelector("body > video").currentTime > 2.5,
+  );
+  const full = await page.evaluate(() => window.fadeRms());
+  expect(full).toBeGreaterThan(0.01);
+  expect(full).toBeGreaterThan(early * 1.8);
+  await source().locator('[data-action="play-cue"]').click();
+  await expect(source().locator("[data-track-status]")).toHaveText(
+    "Fading out",
+  );
+  expect(await page.locator("body > video").evaluate((el) => el.paused)).toBe(
+    false,
+  );
+  await page.waitForTimeout(200);
+  const fading = await page.evaluate(() => window.fadeRms());
+  expect(fading).toBeLessThan(full * 0.9);
+  await expect
+    .poll(() => page.locator("body > video").evaluate((el) => el.paused))
+    .toBe(true);
+  await page.waitForTimeout(150);
+  expect(await page.evaluate(() => window.fadeRms())).toBeLessThan(0.002);
+  await source().locator('[data-action="play-cue"]').click();
+  await page.waitForTimeout(1300);
+  await source().locator('[data-action="stop-cue"]').click();
+  await expect(source().locator("[data-track-status]")).toHaveText(
+    "Fading out",
+  );
+  expect(await page.locator("body > video").evaluate((el) => el.paused)).toBe(
+    false,
+  );
+  await expect
+    .poll(() => page.locator("body > video").evaluate((el) => el.paused))
+    .toBe(true);
+  await expect(source().locator("[data-track-elapsed]")).toHaveText("00:01.00");
+  await source()
+    .getByRole("button", { name: /Configure/ })
+    .click();
+  await page.getByRole("spinbutton", { name: "Fade in (seconds)" }).fill("0");
+  await expect(
+    page.getByRole("spinbutton", { name: "Fade out (seconds)" }),
+  ).toHaveValue("0.6");
+  await page.getByRole("button", { name: "Save configuration" }).click();
+  await source().locator('[data-action="play-cue"]').click();
+  const rect = await source().locator(".wave-wrap").boundingBox();
+  await page.mouse.click(
+    rect.x + (rect.width * 10.9) / m.duration,
+    rect.y + rect.height / 2,
+  );
+  await page.waitForTimeout(150);
+  const beforeEnd = await page.evaluate(() => window.fadeRms());
+  await page.waitForFunction(
+    () => document.querySelector("body > video").currentTime > 11.7,
+  );
+  const ending = await page.evaluate(() => window.fadeRms());
+  expect(ending).toBeLessThan(beforeEnd * 0.7);
+  await expect(page.locator(".active-cue")).toHaveAttribute("data-index", "1");
+  expect(await page.locator("body > video").evaluate((el) => el.paused)).toBe(
+    true,
+  );
+  await source()
+    .getByRole("button", { name: /Configure/ })
+    .click();
+  await page.getByRole("radio", { name: "On", exact: true }).check();
+  await page.getByRole("button", { name: "Save configuration" }).click();
+  await source().locator('[data-action="play-cue"]').click();
+  const near = await source().locator(".wave-wrap").boundingBox();
+  await page.mouse.click(
+    near.x + (near.width * 11.7) / m.duration,
+    near.y + near.height / 2,
+  );
+  await source().locator('[data-action="stop-cue"]').click();
+  await expect(source().locator("[data-track-elapsed]")).toHaveText("00:01.00");
+  await page.waitForTimeout(500);
+  await expect(page.locator(".active-cue")).toHaveAttribute("data-index", "0");
+  expect(await page.locator("body > video").evaluate((el) => el.paused)).toBe(
+    true,
+  );
+  await page.evaluate(() => window.fadeMeter.close());
+  await page.request.delete("/api/sequences/" + seq.id);
+});
+
+test("offline mode keeps cached edits and file renames across reload, then syncs existing sequences", async ({
+  page,
+}) => {
+  await signIn(page);
+  const ws = await (await page.request.get("/api/workspace")).json();
+  const m = ws.media[0];
+  const originalFilename = m.filename;
+  const seq = await (
+    await page.request.post("/api/sequences", {
+      data: {
+        name: "Offline rename QA",
+        cues: [
+          {
+            id: "offline-cue",
+            mediaId: m.id,
+            start: 1,
+            end: 5,
+            volume: 85,
+            speed: 1.2,
+            cueText: "Original",
+            fadeIn: 0.2,
+            fadeOut: 0.3,
+          },
+        ],
+      },
+    })
+  ).json();
+  await page.reload();
+  await page.locator(".sequence-tile").filter({ hasText: seq.name }).click();
+  await page.getByRole("button", { name: "Cache all", exact: true }).click();
+  await expect(
+    page.getByText("Cached on this device. Available offline.", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await page.evaluate(() => navigator.serviceWorker.ready);
+  await expect
+    .poll(() =>
+      page.evaluate(() => Boolean(navigator.serviceWorker.controller)),
+    )
+    .toBe(true);
+  const pending = () =>
+    page.evaluate(async () =>
+      (await import("/outbox.js")).queuedChanges("admin"),
+    );
+  await expect.poll(async () => (await pending()).length).toBe(0);
+  await page
+    .getByRole("button", { name: "Theme and keyboard settings" })
+    .click();
+  await page
+    .getByRole("checkbox", { name: "Offline mode", exact: true })
+    .check();
+  await expect(page.locator("#online-status")).toHaveText("Offline mode");
+  await page.locator('#modal [data-action="close-modal"]').first().click();
+  const requests = [];
+  page.on("request", (r) => {
+    if (new URL(r.url()).pathname.startsWith("/api/")) requests.push(r.url());
+  });
+  await page
+    .getByRole("textbox", { name: "Cue word for cue 1" })
+    .fill("Stand by");
+  await page
+    .getByRole("textbox", { name: "Crop in for cue 1" })
+    .fill("00:01:25");
+  await page.keyboard.press("Control+s");
+  await expect(page.locator("#save-status")).toContainText("Saved locally");
+  await page.locator('[data-tab="media"]').click();
+  await page.locator(`[data-action="rename-media"][data-id="${m.id}"]`).click();
+  const name = page.getByRole("textbox", { name: `File name for ${m.id}` });
+  await name.fill("Renamed offline.wav");
+  await name.press("Control+s");
+  await expect(
+    page.getByRole("button", { name: "Rename Renamed offline.wav" }),
+  ).toBeVisible();
+  await expect
+    .poll(
+      async () => (await pending()).filter((e) => e.kind === "media").length,
+    )
+    .toBe(1);
+  await page.reload();
+  await expect(page.locator("#online-status")).toHaveText("Offline mode");
+  await expect(
+    page.getByRole("textbox", { name: "Cue word for cue 1" }),
+  ).toHaveValue("Stand by");
+  await expect(
+    page.getByRole("textbox", { name: "Crop in for cue 1" }),
+  ).toHaveValue("00:01:25");
+  await expect(page.locator(".cue-name").first()).toHaveText("Renamed offline");
+  await page.locator('[data-action="play-cue"]').first().click();
+  await expect
+    .poll(() => page.locator("body > video").evaluate((el) => el.currentTime))
+    .toBeGreaterThan(1.3);
+  await page.locator('[data-action="stop-cue"]').first().click();
+  expect(requests).toEqual([]);
+  const before = await (await page.request.get("/api/workspace")).json();
+  expect(before.media.find((x) => x.id === m.id).filename).toBe(
+    originalFilename,
+  );
+  expect(before.sequences.find((x) => x.id === seq.id).cues[0].cueText).toBe(
+    "Original",
+  );
+  await page
+    .getByRole("button", { name: "Theme and keyboard settings" })
+    .click();
+  await page
+    .getByRole("checkbox", { name: "Offline mode", exact: true })
+    .uncheck();
+  await expect(page.locator("#online-status")).toHaveText("Online");
+  await expect.poll(async () => (await pending()).length).toBe(0);
+  const after = await (await page.request.get("/api/workspace")).json();
+  const saved = after.sequences.find((x) => x.id === seq.id).cues[0];
+  expect(saved).toMatchObject({
+    mediaId: m.id,
+    start: 1.25,
+    end: 5,
+    volume: 85,
+    speed: 1.2,
+    cueText: "Stand by",
+    fadeIn: 0.2,
+    fadeOut: 0.3,
+  });
+  expect(after.media.find((x) => x.id === m.id).url).toBe(m.url);
+  const exported = await (
+    await page.request.get(`/api/sequences/${seq.id}/download`)
+  ).text();
+  expect(exported).toContain("\nRenamed offline.wav\n");
+  await page.request.patch(`/api/media/${m.id}`, {
+    data: { filename: originalFilename },
+  });
+  await page.request.delete(`/api/sequences/${seq.id}`);
+});
+
+test("network loss retains edits and an edit during sync is not acknowledged away", async ({
+  page,
+  context,
+}) => {
+  await signIn(page);
+  const activeId = await page
+    .locator(".sequence-tile.active")
+    .getAttribute("data-id");
+  await page.getByRole("button", { name: "Cache all", exact: true }).click();
+  await expect(
+    page.getByText("Cached on this device. Available offline.", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(page.locator("#save-status")).toHaveText("All changes saved");
+  await context.setOffline(true);
+  await expect(page.locator("#online-status")).toHaveText("Offline");
+  const word = page.getByRole("textbox", { name: "Cue word for cue 1" });
+  await word.fill("Offline version");
+  await expect(page.locator("#save-status")).toContainText("Saved locally");
+  let release, started;
+  const waiting = new Promise((r) => {
+    started = r;
+  });
+  const gate = new Promise((r) => {
+    release = r;
+  });
+  await page.route("**/api/sequences/*", async (route) => {
+    if (route.request().method() !== "PUT") return route.continue();
+    const response = await route.fetch();
+    started();
+    await gate;
+    await route.fulfill({ response });
+  });
+  await context.setOffline(false);
+  await waiting;
+  await word.fill("Latest version");
+  await expect
+    .poll(() =>
+      page.evaluate(async () => {
+        const entries = await (
+          await import("/outbox.js")
+        ).queuedChanges("admin");
+        return entries.find((e) => e.kind === "sequence")?.data.cues[0].cueText;
+      }),
+    )
+    .toBe("Latest version");
+  release();
+  await expect(page.locator("#save-status")).toHaveText("All changes saved");
+  const ws = await (await page.request.get("/api/workspace")).json();
+  expect(ws.sequences.find((s) => s.id === activeId).cues[0].cueText).toBe(
+    "Latest version",
+  );
+});
+
+test("missing sequence sync is blocked once instead of repeatedly requesting 404", async ({
+  page,
+}) => {
+  await signIn(page);
+  let attempts = 0;
+  await page.route("**/api/sequences/*", async (route) => {
+    if (route.request().method() !== "PUT") return route.continue();
+    attempts++;
+    await route.fulfill({
+      status: 404,
+      json: { error: "Sequence not found." },
+    });
+  });
+  await page
+    .getByRole("textbox", { name: "Cue word for cue 1" })
+    .fill("First local edit");
+  await expect(page.locator("#save-status")).toContainText("sync issue");
+  await page
+    .getByRole("textbox", { name: "Cue word for cue 1" })
+    .fill("Second local edit");
+  await expect
+    .poll(() =>
+      page.evaluate(async () => {
+        const entries = await (
+          await import("/outbox.js")
+        ).queuedChanges("admin");
+        return entries.find((e) => e.kind === "sequence")?.data.cues[0].cueText;
+      }),
+    )
+    .toBe("Second local edit");
+  await page.waitForTimeout(1000);
+  expect(attempts).toBe(1);
+  await page.unroute("**/api/sequences/*");
+  await page.locator("#save-status").click();
+  await page.getByRole("button", { name: "Sync now", exact: true }).click();
+  await expect(page.locator("#save-status")).toHaveText("All changes saved");
+});
+
+test("missing media is not fetched again when changing tabs or selecting the cue", async ({
+  page,
+}) => {
+  await signIn(page);
+  const ws = await (await page.request.get("/api/workspace")).json();
+  const m = ws.media[0];
+  const seq = await (
+    await page.request.post("/api/sequences", {
+      data: {
+        name: "Missing media QA",
+        cues: [{ id: "missing-source", mediaId: m.id, start: 0, end: 2 }],
+      },
+    })
+  ).json();
+  let requests = 0;
+  await page.route("**" + m.url, async (route) => {
+    requests++;
+    await route.fulfill({ status: 404, body: "Missing file" });
+  });
+  await page.reload();
+  await page.locator(".sequence-tile").filter({ hasText: seq.name }).click();
+  await expect(page.locator(".cue-card")).toHaveCount(1);
+  await expect.poll(() => requests).toBeGreaterThan(0);
+  await expect(page.locator('[data-action="play-cue"]')).toBeEnabled();
+  const firstAttempts = requests;
+  for (let i = 0; i < 3; i++) {
+    await page.locator('[data-tab="player"]').click();
+    await page.locator(".cue-name").click();
+    await page.locator('[data-tab="editor"]').click();
+    await page.locator(".cue-name").click();
+  }
+  await page.waitForTimeout(300);
+  expect(requests).toBe(firstAttempts);
+  await page.request.delete("/api/sequences/" + seq.id);
 });

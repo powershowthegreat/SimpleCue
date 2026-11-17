@@ -6,7 +6,16 @@ import {
   cacheKeys,
   mediaBlob,
   peaks,
+  setMediaNetworkEnabled,
 } from "./cache.js";
+import { renameMediaFile } from "./media-name.js";
+import {
+  queueChange,
+  queuedChanges,
+  acknowledge,
+  blockChange,
+  retryChanges,
+} from "./outbox.js";
 import { CueEngine } from "./engine.js";
 import { formatTime as fmt, formatCropTime, parseCropTime } from "./time.js";
 const $ = (s) => document.querySelector(s),
@@ -33,6 +42,8 @@ function modifierSummary(c, index) {
   if (loop === "forever") parts.push("loop forever");
   else if (loop > 1) parts.push(`loop ${loop}x`);
   if (linkedToNext(c, index)) parts.push("autoplay next");
+  if (c.fadeIn > 0) parts.push(`fade in ${c.fadeIn}s`);
+  if (c.fadeOut > 0) parts.push(`fade out ${c.fadeOut}s`);
   return parts.join(" | ");
 }
 function normalizeLinks(s) {
@@ -61,11 +72,18 @@ const state = {
   busy: new Set(),
   collapsed: new Set(),
   offline: !navigator.onLine,
+  manualOffline: localStorage.getItem("simplecue-offline-mode") === "true",
+  pending: [],
+  syncing: false,
+  authExpired: false,
+  verifiedUser: null,
   prefs: { accent: "#d6e5a5", keybinds: { ...defaults } },
   devices: [],
   deviceLabel: "System default",
   user: null,
 };
+const isOffline = () =>
+  state.manualOffline || state.offline || !navigator.onLine;
 const current = () =>
   state.sequences.find((s) => s.id === state.activeId) || state.sequences[0];
 const media = (id) => state.media.find((m) => m.id === id);
@@ -87,8 +105,6 @@ const isCached = (type, id) =>
         ?.cues.every((c) => state.cached.has(`media:${c.mediaId}`));
 const engine = new CueEngine(current, media);
 let renderIndex = -1,
-  saveTimers = new Map(),
-  saving = new Map(),
   keyCapture = null,
   uploadFolder = "Uploads",
   waveResize;
@@ -100,43 +116,96 @@ function toast(message, error = false) {
   $("#toast-region").append(d);
   setTimeout(() => d.remove(), 5000);
 }
-async function readResponse(r, url) {
+async function readResponse(r, url, silentAuth = false) {
+  const responseError = (message) =>
+    Object.assign(new Error(message), { status: r.status });
   const text = await r.text();
   let data;
   try {
     data = text ? JSON.parse(text) : {};
   } catch {
     if (r.status === 413)
-      throw new Error(
-        "The hosting service rejected the upload size (HTTP 413). Reload to use chunked local uploads, or configure Vercel Blob for cloud uploads.",
+      throw responseError(
+        "The hosting service rejected the upload size (HTTP 413). Reload to use chunked local uploads, or configure Upstash Blob for cloud uploads.",
       );
     if (r.status === 401 || r.status === 403)
-      throw new Error(
+      throw responseError(
         `The hosting service denied this request (HTTP ${r.status}). Check deployment access and sign in again.`,
       );
     if (r.status >= 500)
-      throw new Error(
+      throw responseError(
         `The server or upload gateway failed (HTTP ${r.status}). Retry after checking the server logs.`,
       );
-    throw new Error(
+    throw responseError(
       `Expected an API response but received a page (HTTP ${r.status}). Check that /api routes point to the Express function, then reload.`,
     );
   }
   if (!r.ok) {
-    if (r.status === 401 && url != "/api/login") showLogin();
-    throw new Error(data.error || `Request failed (HTTP ${r.status}).`);
+    if (r.status === 401 && url != "/api/login" && !silentAuth) showLogin();
+    throw Object.assign(
+      new Error(data.error || `Request failed (HTTP ${r.status}).`),
+      { status: r.status },
+    );
   }
   return data;
 }
+let networkController = new AbortController(),
+  probeTimer = null,
+  probeDelay = 10000,
+  probing = null,
+  endpointMissing = false;
+const offlineError = () =>
+  Object.assign(
+    new Error(
+      "Offline: changes are saved on this device and will sync after reconnecting.",
+    ),
+    { offline: true },
+  );
+function updateConnectivity() {
+  setMediaNetworkEnabled(!isOffline());
+  navigator.serviceWorker?.controller?.postMessage({
+    type: "NETWORK_MODE",
+    offline: isOffline(),
+  });
+  if ("serviceWorker" in navigator)
+    navigator.serviceWorker.ready
+      .then((reg) =>
+        reg.active?.postMessage({ type: "NETWORK_MODE", offline: isOffline() }),
+      )
+      .catch(() => {});
+  const badge = $("#online-status");
+  if (badge) {
+    badge.innerHTML = `<i></i>${state.manualOffline ? "Offline mode" : isOffline() ? "Offline" : "Online"}`;
+    badge.dataset.offline = String(isOffline());
+    badge.title = state.manualOffline
+      ? "Offline mode is on in settings"
+      : isOffline()
+        ? "Server unavailable. Click to retry."
+        : "Connected to the server";
+  }
+  $("#login-offline-toggle")?.classList.toggle("hidden", !state.manualOffline);
+  updateCacheStatus();
+  updateSyncStatus();
+}
+function scheduleProbe() {
+  clearTimeout(probeTimer);
+  if (state.manualOffline || !navigator.onLine || endpointMissing) return;
+  probeTimer = setTimeout(() => probeConnection(), probeDelay);
+  probeDelay = Math.min(60000, probeDelay * 2);
+}
+function markOffline() {
+  state.offline = true;
+  state.verifiedUser = null;
+  updateConnectivity();
+  scheduleProbe();
+}
 async function api(url, options = {}) {
-  if (state.offline)
-    throw new Error(
-      "Reconnect to save changes to the server. Cached playback is available offline.",
-    );
-  let r;
+  if (isOffline()) throw offlineError();
+  let response;
   try {
-    r = await fetch(url, {
+    response = await fetch(url, {
       ...options,
+      signal: options.signal || networkController.signal,
       headers:
         options.body instanceof FormData
           ? options.headers
@@ -147,11 +216,87 @@ async function api(url, options = {}) {
           : options.body,
     });
   } catch {
-    throw new Error(
-      "Cannot reach the server. Your cached media is still available.",
-    );
+    if (!state.manualOffline) markOffline();
+    throw offlineError();
   }
-  return readResponse(r, url);
+  if (response.status >= 500) {
+    markOffline();
+    throw Object.assign(offlineError(), { status: response.status });
+  }
+  if (
+    response.status === 404 &&
+    ["/api/session", "/api/workspace", "/api/health"].includes(url)
+  ) {
+    endpointMissing = true;
+    markOffline();
+    throw Object.assign(offlineError(), { status: 404 });
+  }
+  return readResponse(response, url, options.silentAuth);
+}
+async function probeConnection() {
+  if (state.manualOffline || !navigator.onLine) {
+    updateConnectivity();
+    return false;
+  }
+  if (probing) return probing;
+  probing = (async () => {
+    try {
+      const response = await fetch("/api/health", {
+        cache: "no-store",
+        signal: AbortSignal.timeout(5000),
+      });
+      if (response.status === 404) {
+        endpointMissing = true;
+        markOffline();
+        return false;
+      }
+      if (!response.ok) throw new Error("Server unavailable.");
+      const health = await response.json();
+      if (!health.ok) throw new Error("Server unavailable.");
+      if (state.manualOffline) return false;
+      state.offline = false;
+      endpointMissing = false;
+      probeDelay = 10000;
+      clearTimeout(probeTimer);
+      updateConnectivity();
+      if (state.user) {
+        const user = await api("/api/session", { silentAuth: true });
+        if (user.username !== state.user.username) {
+          state.authExpired = true;
+          updateSyncStatus();
+          return false;
+        }
+        state.verifiedUser = user.username;
+        state.authExpired = false;
+        await syncPending();
+      }
+      return true;
+    } catch (error) {
+      if (error.status === 401) {
+        state.authExpired = true;
+        updateSyncStatus();
+      } else markOffline();
+      return false;
+    } finally {
+      probing = null;
+    }
+  })();
+  return probing;
+}
+async function setOfflineMode(enabled) {
+  state.manualOffline = enabled;
+  localStorage.setItem("simplecue-offline-mode", String(enabled));
+  await cacheSet("meta", "network-mode", enabled);
+  networkController.abort();
+  networkController = new AbortController();
+  clearTimeout(probeTimer);
+  updateConnectivity();
+  render();
+  if (!enabled) {
+    endpointMissing = false;
+    state.offline = !navigator.onLine;
+    await probeConnection();
+  }
 }
 function setAccent(color) {
   if (!/^#[0-9a-f]{6}$/i.test(color)) return;
@@ -169,16 +314,20 @@ function setTheme(mode) {
   drawWaves();
 }
 async function prefs() {
-  localStorage.setItem(
-    "simplecue-prefs",
-    JSON.stringify({ ...state.prefs, activeId: state.activeId }),
-  );
+  const values = { ...state.prefs, activeId: state.activeId };
+  localStorage.setItem("simplecue-prefs", JSON.stringify(values));
   await persistWorkspace();
-  if (!state.offline)
-    api("/api/preferences", {
-      method: "PUT",
-      body: { ...state.prefs, activeId: state.activeId },
-    }).catch((e) => toast(e.message, true));
+  if (state.user) {
+    await queueChange(
+      state.user.username,
+      "preferences",
+      "settings",
+      "put",
+      values,
+    );
+    await refreshPending();
+    requestSync();
+  }
 }
 async function persistWorkspace() {
   await cacheSet("meta", "workspace", {
@@ -186,6 +335,8 @@ async function persistWorkspace() {
     sequences: state.sequences,
     preferences: { ...state.prefs, activeId: state.activeId },
     user: state.user,
+    database: state.database,
+    uploads: state.uploads,
   });
 }
 async function refreshCache() {
@@ -197,7 +348,7 @@ function updateCacheStatus() {
   $("#cache-status").innerHTML =
     `${icon("harddrive")}${n} / ${state.media.length} media cached`;
   $("#connection-status").innerHTML =
-    `<i class="status-dot" style="${state.offline ? "background:#c79e69" : ""}"></i> ${state.offline ? "Offline · cached playback" : state.database === "redis" ? "Redis connected" : "Local storage"}`;
+    `<i class="status-dot" style="${isOffline() ? "background:#c79e69" : ""}"></i> ${isOffline() ? "Offline · local workspace" : state.database === "redis" ? "Redis connected" : "Local storage"}`;
 }
 function cacheButton(type, id, small = false) {
   const yes = isCached(type, id),
@@ -241,6 +392,7 @@ function cropValue(cue, key, seconds) {
   return value;
 }
 function setCropPoint(cueId, key, seconds) {
+  assertEditable(current());
   const seq = current(),
     index = seq?.cues.findIndex((c) => c.id === cueId),
     cue = seq?.cues[index];
@@ -256,7 +408,7 @@ function renderCue(c, i, production = false) {
   if (!m) return "";
   return `<article class="cue-card ${production ? "production-cue" : ""} ${i === engine.index ? "active-cue" : ""}" data-cue-id="${esc(c.id)}" data-index="${i}">
     <div class="cue-card-top" ${!production ? `draggable="true" data-cue-drag="${i}"` : ""}><span class="cue-number" title="${production ? "Cue number" : "Drag track to reorder"}">${String(i + 1).padStart(2, "0")}</span>
-      <div class="cue-name-row"><div><div class="cue-name">${esc(m.name)}</div></div><span class="filetype">${esc(m.extension)}</span></div>
+      <div class="cue-name-row"><div><div class="cue-name">${esc(m.name)}</div></div><span class="filetype">${esc(m.extension)}</span>${production ? (c.cueText ? `<strong class="cue-word">${esc(c.cueText)}</strong>` : "") : `<input class="cue-word cue-word-input" type="text" data-cue-setting="cueText" data-index="${i}" aria-label="Cue word for cue ${i + 1}" placeholder="Cue word" maxlength="120" value="${esc(c.cueText || "")}" autocomplete="off">`}</div>
       ${production ? `<span class="production-settings">${c.volume}% · ${c.speed}× · ${modifierSummary(c, i) || "Manual next"}</span>` : ""}
       ${cacheButton("media", m.id, true)}${!production ? `<button class="icon-button small" data-action="cue-duplicate" data-index="${i}" aria-label="Duplicate ${esc(m.name)}" title="Duplicate track">${icon("copy")}</button><button class="icon-button small danger-button" data-action="cue-remove" data-index="${i}" aria-label="Delete ${esc(m.name)}" title="Delete track from sequence">${icon("trash")}</button>` : ""}
     </div>
@@ -273,7 +425,7 @@ function trackTransport(c, i) {
         : c.start,
     total = c.end;
   return `<div class="track-transport" data-track-transport="${i}">
-    <button class="icon-button track-play" data-action="play-cue" data-index="${i}" aria-label="Play ${esc(media(c.mediaId)?.name)}" title="Play / pause">${icon(active && engine.playing ? "pause" : "play")}</button>
+    <button class="icon-button track-play" data-action="play-cue" data-index="${i}" aria-label="Play ${esc(media(c.mediaId)?.name)}" title="Play / pause">${icon(active && engine.playing && !engine.pausing ? "pause" : "play")}</button>
     <button class="icon-button small" data-action="reset-cue" data-index="${i}" aria-label="Reset cue ${i + 1}" title="Reset to in point">${icon("reset")}</button>
     <button class="icon-button small" data-action="stop-cue" data-index="${i}" aria-label="Stop cue ${i + 1}" title="Stop">${icon("stop")}</button>
     <span class="track-time" data-track-elapsed="${i}">${fmt(elapsed)}</span>
@@ -312,7 +464,7 @@ function renderMediaRows() {
     filteredRows()
       .map(
         (m) =>
-          `<tr><td><input type="checkbox" data-select-id="${esc(m.id)}" aria-label="Select ${esc(m.name)}" ${state.selected.has(m.id) ? "checked" : ""}></td><td><div class="table-name"><span class="file-icon">${icon(seq ? "file" : m.type.startsWith("video") ? "video" : "audio")}</span><div><div class="tile-title">${esc(m.name)}</div><div class="tile-meta">${esc(seq ? m.description : m.filename)}${m.demo ? " · Sample" : ""}</div></div></div></td><td>${esc(seq ? "M3U" : m.extension)}</td><td>${seq ? `${m.cues.length} cues` : esc(m.folder)}</td><td>${fmt(seq ? duration(m) : m.duration)}</td><td>${seq ? "—" : bytes(m.size)}</td><td><span class="${isCached(type, m.id) ? "cached-pill" : "cached-pill no"}">${icon(isCached(type, m.id) ? "check" : "harddrive")}${isCached(type, m.id) ? "Cached" : "Not cached"}</span></td><td>${new Date(m.updatedAt || m.createdAt).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}</td><td><div class="table-actions">${cacheButton(type, m.id, true)}<button class="icon-button small" data-action="${seq ? "open-sequence" : "preview-media"}" data-id="${esc(m.id)}" aria-label="${seq ? "Open sequence" : "Preview media"}" title="${seq ? "Open sequence" : "Preview media"}">${icon("play")}</button><button class="icon-button small" data-action="download-${type}" data-id="${esc(m.id)}" aria-label="Download ${esc(m.name)}" title="Download file">${icon("file")}</button><button class="icon-button small" data-action="${seq ? "edit-row-sequence" : "edit-media"}" data-id="${esc(m.id)}" aria-label="Edit ${esc(m.name)}" title="Edit details">${icon("edit")}</button><button class="icon-button small danger-button" data-action="delete-${type}" data-id="${esc(m.id)}" aria-label="Delete ${esc(m.name)}" title="Delete">${icon("trash")}</button></div></td></tr>`,
+          `<tr><td><input type="checkbox" data-select-id="${esc(m.id)}" aria-label="Select ${esc(m.name)}" ${state.selected.has(m.id) ? "checked" : ""}></td><td><div class="table-name"><span class="file-icon">${icon(seq ? "file" : m.type.startsWith("video") ? "video" : "audio")}</span><div>${seq ? `<div class="tile-title">${esc(m.name)}</div>` : `<button class="media-name-button tile-title" data-action="rename-media" data-id="${esc(m.id)}" title="Rename file" aria-label="Rename ${esc(m.filename)}">${esc(m.name)} ${icon("edit")}</button>`}<div class="tile-meta">${esc(seq ? m.description : m.filename)}${m.demo ? " · Sample" : ""}</div></div></div></td><td>${esc(seq ? "M3U" : m.extension)}</td><td>${seq ? `${m.cues.length} cues` : esc(m.folder)}</td><td>${fmt(seq ? duration(m) : m.duration)}</td><td>${seq ? "—" : bytes(m.size)}</td><td><span class="${isCached(type, m.id) ? "cached-pill" : "cached-pill no"}">${icon(isCached(type, m.id) ? "check" : "harddrive")}${isCached(type, m.id) ? "Cached" : "Not cached"}</span></td><td>${new Date(m.updatedAt || m.createdAt).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}</td><td><div class="table-actions">${cacheButton(type, m.id, true)}<button class="icon-button small" data-action="${seq ? "open-sequence" : "preview-media"}" data-id="${esc(m.id)}" aria-label="${seq ? "Open sequence" : "Preview media"}" title="${seq ? "Open sequence" : "Preview media"}">${icon("play")}</button><button class="icon-button small" data-action="download-${type}" data-id="${esc(m.id)}" aria-label="Download ${esc(m.name)}" title="Download file">${icon("file")}</button><button class="icon-button small" data-action="${seq ? "edit-row-sequence" : "edit-media"}" data-id="${esc(m.id)}" aria-label="Edit ${esc(m.name)}" title="Edit details">${icon("edit")}</button><button class="icon-button small danger-button" data-action="delete-${type}" data-id="${esc(m.id)}" aria-label="Delete ${esc(m.name)}" title="Delete">${icon("trash")}</button></div></td></tr>`,
       )
       .join("") ||
     '<tr><td colspan="9"><div class="empty-state">No files found. Try another search or upload something new.</div></td></tr>'
@@ -342,6 +494,7 @@ function render() {
   });
   renderIndex = engine.index;
   applyPanelLayout();
+  applyOfflineControls();
   drawWaves();
   updateEngineUI();
   updateCacheStatus();
@@ -441,10 +594,12 @@ function updateEngineUI() {
     e.classList.toggle("playing", active && engine.playing);
     const p = e.querySelector('[data-action="play-cue"]');
     if (p) {
-      p.innerHTML = icon(active && engine.playing ? "pause" : "play");
+      p.innerHTML = icon(
+        active && engine.playing && !engine.pausing ? "pause" : "play",
+      );
       p.setAttribute(
         "aria-label",
-        `${active && engine.playing ? "Pause" : "Play"} ${media(current()?.cues[Number(e.dataset.index)]?.mediaId)?.name || "cue"}`,
+        `${active && engine.playing && !engine.pausing ? "Pause" : "Play"} ${media(current()?.cues[Number(e.dataset.index)]?.mediaId)?.name || "cue"}`,
       );
     }
   });
@@ -454,18 +609,20 @@ function updateEngineUI() {
         Number(e.dataset.trackStatus) === engine.index
           ? engine.loading
             ? "Loading"
-            : engine.playing
-              ? (engine.cue.loop ?? 1) !== 1
-                ? `Play ${engine.iteration}/${engine.cue.loop === "forever" ? "∞" : engine.cue.loop}`
-                : "Playing"
-              : engine.finished
-                ? "Ended"
-                : "Active"
+            : engine.pausing
+              ? "Fading out"
+              : engine.playing
+                ? (engine.cue.loop ?? 1) !== 1
+                  ? `Play ${engine.iteration}/${engine.cue.loop === "forever" ? "∞" : engine.cue.loop}`
+                  : "Playing"
+                : engine.finished
+                  ? "Ended"
+                  : "Active"
           : "Ready"),
   );
   if ($("#deck-status"))
     $("#deck-status").innerHTML =
-      `<i class="status-dot"></i>${engine.loading ? "Loading" : engine.playing ? "Playing" : engine.finished ? "Complete" : "Standing by"}`;
+      `<i class="status-dot"></i>${engine.loading ? "Loading" : engine.pausing ? "Fading out" : engine.playing ? "Playing" : engine.finished ? "Complete" : "Standing by"}`;
   $$("[data-master-label]").forEach(
     (e) => (e.textContent = Math.round(engine.master * 100)),
   );
@@ -509,7 +666,7 @@ function keyLabel(key) {
 function settings() {
   openModal(
     "Workspace settings",
-    `<p>Theme and keyboard shortcuts.</p><div class="setting-label">HIGHLIGHT COLOR</div><div class="color-options">${["#d6e5a5", "#e7c896", "#bccfe4", "#d9bfdc", "#e4b4a2", "#b4d8c8"].map((c) => `<button class="color-swatch ${state.prefs.accent === c ? "selected" : ""}" style="background:${c}" data-action="accent" data-color="${c}" aria-label="Use ${c} theme"></button>`).join("")}<input class="custom-color" type="color" id="custom-accent" value="${state.prefs.accent}" aria-label="Custom highlight color"></div><div class="setting-label">KEYBOARD SHORTCUTS</div>${[
+    `<label class="offline-mode-option"><span><strong>Offline mode</strong><small>Edit cached sequences locally. Sync resumes when this is turned off and the server is reachable.</small></span><input type="checkbox" id="offline-mode-toggle" ${state.manualOffline ? "checked" : ""} aria-label="Offline mode"></label><p>Theme and keyboard shortcuts.</p><div class="setting-label">HIGHLIGHT COLOR</div><div class="color-options">${["#d6e5a5", "#e7c896", "#bccfe4", "#d9bfdc", "#e4b4a2", "#b4d8c8"].map((c) => `<button class="color-swatch ${state.prefs.accent === c ? "selected" : ""}" style="background:${c}" data-action="accent" data-color="${c}" aria-label="Use ${c} theme"></button>`).join("")}<input class="custom-color" type="color" id="custom-accent" value="${state.prefs.accent}" aria-label="Custom highlight color"></div><div class="setting-label">KEYBOARD SHORTCUTS</div>${[
       ["toggle", "Play / pause"],
       ["next", "Next cue"],
       ["previous", "Previous cue"],
@@ -526,6 +683,7 @@ function settings() {
   );
 }
 function cueConfig(cueId) {
+  assertEditable(current());
   const seq = current(),
     index = seq.cues.findIndex((c) => c.id === cueId),
     c = seq.cues[index];
@@ -541,72 +699,275 @@ function cueConfig(cueId) {
     <fieldset class="cue-option-group"><legend>Linkage: to next</legend><div class="cue-link-options"><label><input type="radio" name="linkNext" value="off" ${!on ? "checked" : ""}> Off</label><label><input type="radio" name="linkNext" value="on" ${on ? "checked" : ""} ${!next ? "disabled" : ""}> On</label></div><div class="settings-note">${next ? `Next: ${esc(media(next.mediaId).name)}` : "Last cue — no next track."}</div></fieldset>
     <label class="form-label">Loop<select name="loopMode" id="cue-loop-mode"><option value="off" ${mode === "off" ? "selected" : ""}>Off</option><option value="count" ${mode === "count" ? "selected" : ""}>N times</option><option value="forever" ${mode === "forever" ? "selected" : ""}>Forever</option></select></label>
     <label class="form-label ${mode === "count" ? "" : "hidden"}" id="loop-count-label">Number of plays<input type="number" name="loopCount" min="1" max="10000" step="1" value="${typeof loop === "number" && loop > 1 ? loop : 2}" ${mode !== "count" ? "disabled" : ""} required><span class="settings-note">Total plays, including the first.</span></label>
+    <div class="fade-options"><label class="form-label">Fade in (seconds)<input type="number" name="fadeIn" min="0" max="3600" step=".01" value="${c.fadeIn || 0}" required></label><label class="form-label">Fade out (seconds)<input type="number" name="fadeOut" min="0" max="3600" step=".01" value="${c.fadeOut || 0}" required></label></div>
+    <p class="settings-note">Zero disables a fade. Fade out applies before the Out point and before pausing or stopping; fade lengths are limited to available playback time.</p>
     <p class="settings-note">Loops use the In/Out range. Linked playback starts after the final play. Forever keeps this cue active until stopped or another cue is selected.</p>
     <div id="form-error" class="form-error"></div><button class="button button-dark w-full" type="submit">Save configuration ${icon("check")}</button>
   </form>`,
   );
 }
 function sequenceForm(s = null) {
+  if (s) assertEditable(s);
   openModal(
     s ? "Edit sequence" : "New sequence",
     `<form id="sequence-form" data-id="${esc(s?.id || "")}"><label class="form-label">Sequence name<input name="name" value="${esc(s?.name || "")}" placeholder="e.g. Friday night · Main stage" required maxlength="150" autofocus></label><label class="form-label">Description<textarea name="description" placeholder="Description" maxlength="1000">${esc(s?.description || "")}</textarea></label><div class="form-error" id="form-error"></div><button class="button button-dark w-full" type="submit">${s ? "Save details" : "Create sequence"} ${icon("arrow-right")}</button></form>`,
   );
 }
-function setSaveStatus(label) {
-  $("#save-status").innerHTML =
-    `<i style="${label.includes("Retry") ? "background:#bb825d" : ""}"></i> ${esc(label)}`;
-}
-function scheduleSave(seq) {
-  setSaveStatus("Unsaved changes");
-  clearTimeout(saveTimers.get(seq.id));
-  saveTimers.set(
-    seq.id,
-    setTimeout(
-      () => saveSequence(seq).catch((e) => toast(e.message, true)),
-      500,
-    ),
+let localSaves = new Map(),
+  syncTimer = null,
+  syncPromise = null;
+function canEdit(seq) {
+  return (
+    Boolean(seq) &&
+    (!isOffline() ||
+      state.cached.has(`sequence:${seq.id}`) ||
+      state.pending.some(
+        (e) =>
+          e.kind === "sequence" && e.id === seq.id && e.operation !== "delete",
+      ))
   );
 }
-async function saveSequence(seq) {
-  clearTimeout(saveTimers.get(seq.id));
-  saveTimers.delete(seq.id);
-  if (saving.has(seq.id)) {
-    await saving.get(seq.id).catch(() => {});
-  }
+function assertEditable(seq) {
+  if (!canEdit(seq))
+    throw new Error("Cache this sequence before editing it offline.");
+}
+function applyOfflineControls() {
+  if (!isOffline()) return;
+  const editable = canEdit(current());
+  $$(
+    '.cue-card input,.cue-card select,.cue-card [data-action="cue-config"],.cue-card [data-action="edit-setting-value"],.cue-card [data-action="cue-duplicate"],.cue-card [data-action="cue-remove"],[data-action="edit-sequence"],.add-cue-area',
+  ).forEach((el) => (el.disabled = !editable));
+  if (!editable) $$(".cue-card-top").forEach((el) => (el.draggable = false));
+  $$('[data-action="add-media"]').forEach(
+    (el) => (el.disabled = !editable || !isCached("media", el.dataset.id)),
+  );
+}
+function setSaveStatus(label) {
+  $("#save-status").innerHTML = `<i></i>${esc(label)}`;
+}
+function updateSyncStatus() {
+  const issues = state.pending.filter((e) => e.error).length,
+    n = state.pending.length;
+  setSaveStatus(
+    localSaves.size
+      ? "Saving locally…"
+      : state.authExpired
+        ? "Sign in to sync"
+        : state.syncing
+          ? "Syncing…"
+          : issues
+            ? `${issues} sync ${issues === 1 ? "issue" : "issues"}`
+            : n
+              ? isOffline()
+                ? `Saved locally · ${n} pending`
+                : `${n} pending sync`
+              : "All changes saved",
+  );
+  $("#save-status").title = n
+    ? "Changes are safe on this device. Click for sync details."
+    : "Click to save the active sequence";
+}
+async function refreshPending() {
+  state.pending = state.user ? await queuedChanges(state.user.username) : [];
+  updateSyncStatus();
+}
+function requestSync() {
+  clearTimeout(syncTimer);
+  if (!isOffline() && state.user && !state.authExpired)
+    syncTimer = setTimeout(() => syncPending(), 500);
+}
+async function stageSequence(seq, operation = "put") {
+  if (operation !== "create") assertEditable(seq);
   normalizeLinks(seq);
-  const snapshot = JSON.parse(JSON.stringify(seq));
-  setSaveStatus("Saving changes…");
-  const task = api(`/api/sequences/${seq.id}`, {
-    method: "PUT",
-    body: snapshot,
-  })
-    .then(async (saved) => {
-      seq.updatedAt = saved.updatedAt;
-      await persistWorkspace();
-      if (state.cached.has(`sequence:${seq.id}`)) {
+  const snapshot = structuredClone(seq),
+    owner = state.user?.username;
+  const previous = localSaves.get(seq.id) || Promise.resolve();
+  const job = previous
+    .catch(() => {})
+    .then(async () => {
+      await queueChange(owner, "sequence", seq.id, operation, snapshot);
+      if (
+        state.cached.has(`sequence:${seq.id}`) ||
+        (operation === "create" && isOffline())
+      ) {
         await cacheSet(
           "assets",
           `sequence:${seq.id}`,
-          new Blob([m3uText(saved)], { type: "audio/x-mpegurl" }),
+          new Blob([m3uText(snapshot)], { type: "audio/x-mpegurl" }),
         );
+        state.cached.add(`sequence:${seq.id}`);
       }
-      setSaveStatus(saveTimers.size ? "Unsaved changes" : "All changes saved");
-      return saved;
+      await persistWorkspace();
+      await refreshPending();
     })
-    .catch((e) => {
-      setSaveStatus("Retry save");
-      throw e;
-    })
-    .finally(() => saving.delete(seq.id));
-  saving.set(seq.id, task);
-  return task;
+    .finally(() => {
+      if (localSaves.get(seq.id) === job) localSaves.delete(seq.id);
+      updateSyncStatus();
+    });
+  localSaves.set(seq.id, job);
+  updateSyncStatus();
+  return job;
+}
+function scheduleSave(seq) {
+  stageSequence(seq)
+    .then(requestSync)
+    .catch((error) => toast(error.message, true));
+}
+async function saveSequence(seq) {
+  await stageSequence(seq);
+  if (!isOffline()) await syncPending();
+  const issue = state.pending.find(
+    (e) => e.kind === "sequence" && e.id === seq.id && e.error,
+  );
+  if (issue && !isOffline())
+    throw Object.assign(new Error(issue.error.message), {
+      status: issue.error.status,
+    });
+  return seq;
 }
 async function flushSaves() {
-  for (const [id] of saveTimers) {
-    const s = state.sequences.find((v) => v.id === id);
-    if (s) await saveSequence(s);
+  await Promise.all([...localSaves.values()]);
+  if (!isOffline()) await syncPending();
+}
+async function createSequence(values) {
+  const seq = {
+    ...values,
+    id: crypto.randomUUID(),
+    updatedAt: new Date().toISOString(),
+  };
+  state.sequences.push(seq);
+  await stageSequence(seq, "create");
+  if (!isOffline()) await syncPending();
+  return seq;
+}
+async function syncPending() {
+  if (isOffline() || !state.user || state.authExpired) return;
+  if (syncPromise) return syncPromise;
+  const owner = state.user.username;
+  const work = async () => {
+    if (state.verifiedUser !== owner) {
+      try {
+        const user = await api("/api/session", { silentAuth: true });
+        if (user.username !== owner) {
+          state.authExpired = true;
+          return;
+        }
+        state.verifiedUser = owner;
+      } catch (error) {
+        if (error.status === 401) state.authExpired = true;
+        return;
+      }
+    }
+    state.syncing = true;
+    updateSyncStatus();
+    try {
+      while (!isOffline() && !state.authExpired) {
+        const entry = (await queuedChanges(owner)).find((e) => !e.error);
+        if (!entry) break;
+        try {
+          let saved;
+          if (entry.kind === "sequence") {
+            saved =
+              entry.operation === "delete"
+                ? await api(`/api/sequences/${entry.id}`, {
+                    method: "DELETE",
+                    silentAuth: true,
+                  })
+                : entry.operation === "create"
+                  ? await api("/api/sequences", {
+                      method: "POST",
+                      body: { ...entry.data, clientId: entry.id },
+                      silentAuth: true,
+                    })
+                  : await api(`/api/sequences/${entry.id}`, {
+                      method: "PUT",
+                      body: entry.data,
+                      silentAuth: true,
+                    });
+          } else if (entry.kind === "media")
+            saved = await api(`/api/media/${entry.id}`, {
+              method: "PATCH",
+              body: entry.data,
+              silentAuth: true,
+            });
+          else
+            saved = await api("/api/preferences", {
+              method: "PUT",
+              body: entry.data,
+              silentAuth: true,
+            });
+          const newer = await acknowledge(entry);
+          if (entry.kind === "media") {
+            const m = media(entry.id);
+            if (m) {
+              if (!newer) Object.assign(m, saved);
+              await refreshMediaReferences(m);
+            }
+          }
+          if (entry.kind === "sequence" && entry.operation !== "delete") {
+            const seq = state.sequences.find((s) => s.id === entry.id);
+            if (seq) seq.updatedAt = saved.updatedAt;
+            if (!newer && state.cached.has(`sequence:${entry.id}`))
+              await cacheSet(
+                "assets",
+                `sequence:${entry.id}`,
+                new Blob([m3uText(saved)], { type: "audio/x-mpegurl" }),
+              );
+          }
+        } catch (error) {
+          if (error.offline || isOffline()) break;
+          if (error.status === 401 || error.status === 403) {
+            state.authExpired = true;
+            break;
+          }
+          await blockChange(entry, error);
+        }
+        await refreshPending();
+      }
+    } finally {
+      state.syncing = false;
+      await refreshPending();
+      await persistWorkspace();
+      updateSyncStatus();
+    }
+  };
+  syncPromise = (
+    navigator.locks
+      ? navigator.locks.request(`simplecue-sync:${owner}`, work)
+      : work()
+  )
+    .catch((error) => {
+      if (!error.offline)
+        console.error("SimpleCue sync paused:", error.message);
+    })
+    .finally(() => {
+      syncPromise = null;
+      updateSyncStatus();
+    });
+  return syncPromise;
+}
+async function refreshMediaReferences(m) {
+  for (const seq of state.sequences) {
+    let used = false;
+    for (const cue of seq.cues)
+      if (cue.mediaId === m.id) {
+        cue.name = m.name;
+        used = true;
+      }
+    if (used && state.cached.has(`sequence:${seq.id}`))
+      await cacheSet(
+        "assets",
+        `sequence:${seq.id}`,
+        new Blob([m3uText(seq)], { type: "audio/x-mpegurl" }),
+      );
   }
-  await Promise.all([...saving.values()]);
+}
+function syncDetails() {
+  openModal(
+    "Sync status",
+    `<p>${state.manualOffline ? "Offline mode is enabled." : isOffline() ? "Offline. Changes stay on this device." : "Online. Changes sync to the server."}</p>${state.pending.map((entry) => `<div class="sync-entry"><strong>${esc(entry.data?.name || entry.kind)}</strong><span>${esc(entry.error?.message || "Saved locally · waiting to sync")}</span></div>`).join("") || "<p>No pending changes.</p>"}`,
+    `<button class="button" data-action="settings">Settings</button>${state.authExpired ? '<button class="button button-dark" data-action="sync-sign-in">Sign in to sync</button>' : '<button class="button button-dark" data-action="sync-now">Sync now</button>'}`,
+  );
 }
 let manualSavePromise = null;
 async function saveWorkspaceNow() {
@@ -617,7 +978,16 @@ async function saveWorkspaceNow() {
     return;
   }
   const active = document.activeElement;
-  if (active?.matches(".time-input")) {
+  if (active?.matches(".media-name-input")) {
+    const saved = await active.commitRename();
+    if (saved)
+      toast(
+        isOffline()
+          ? "File name saved on this device. It will sync when online."
+          : "File name saved.",
+      );
+    return;
+  } else if (active?.matches(".time-input")) {
     const cue = current()?.cues[Number(active.dataset.index)];
     cropValue(cue, active.dataset.cueSetting, parseCropTime(active.value));
     // Blur commits through the normal change handler before rendering replaces the focused input.
@@ -641,9 +1011,11 @@ async function saveWorkspaceNow() {
     await saveSequence(seq);
     await flushSaves();
     toast(
-      cached
-        ? "Saved to server and refreshed local cache."
-        : "Saved to server.",
+      isOffline()
+        ? "Saved on this device. Changes will sync when online."
+        : cached
+          ? "Saved to server and refreshed local cache."
+          : "Saved to server.",
     );
   })().finally(() => (manualSavePromise = null));
   return manualSavePromise;
@@ -717,7 +1089,7 @@ async function cacheItem(type, id, remove = false, quiet = false) {
 }
 async function selectSequence(id) {
   await flushSaves();
-  engine.stop();
+  engine.halt(true);
   state.activeId = id;
   state.selected.clear();
   await prefs();
@@ -725,6 +1097,9 @@ async function selectSequence(id) {
   render();
 }
 async function addMedia(id, at = null) {
+  assertEditable(current());
+  if (isOffline() && !isCached("media", id))
+    throw new Error("Only cached media can be added while offline.");
   const s = current(),
     m = media(id);
   if (!s) throw new Error("Create a sequence first.");
@@ -778,9 +1153,10 @@ function download(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 function uploadDialog() {
+  if (isOffline()) throw new Error("Connect to the server to upload media.");
   openModal(
     "Upload media",
-    `<p>Upload audio or video files.</p><label class="form-label">Save to folder<input id="upload-folder" value="Uploads" list="folder-options" maxlength="150"><datalist id="folder-options">${[...new Set(state.media.map((m) => m.folder))].map((f) => `<option value="${esc(f)}">`).join("")}</datalist></label><button class="button button-dark w-full" data-action="choose-files">${icon("upload")} Choose audio or video files</button><p class="settings-note mt-4">WAV, MP3, OGG, M4A, AAC, FLAC, AIFF, MP4, WEBM, MOV.<br>${state.uploads === "disk" ? "Up to 500 MB per file. Transfers use 2 MB chunks." : "Up to 500 MB per file via Vercel Blob."}</p>`,
+    `<p>Upload audio or video files.</p><label class="form-label">Save to folder<input id="upload-folder" value="Uploads" list="folder-options" maxlength="150"><datalist id="folder-options">${[...new Set(state.media.map((m) => m.folder))].map((f) => `<option value="${esc(f)}">`).join("")}</datalist></label><button class="button button-dark w-full" data-action="choose-files">${icon("upload")} Choose audio or video files</button><p class="settings-note mt-4">WAV, MP3, OGG, M4A, AAC, FLAC, AIFF, MP4, WEBM, MOV.<br>${state.uploads === "disk" ? "Up to 500 MB per file. Transfers use 2 MB chunks." : "Up to 500 MB per file via Upstash Blob."}</p>`,
   );
 }
 async function probe(file) {
@@ -846,7 +1222,7 @@ async function uploadLocal(file, metadata) {
     },
   });
   try {
-    for (let offset = 0; offset < file.size; ) {
+    for (let offset = 0; offset < file.size;) {
       const body = file.slice(
         offset,
         Math.min(file.size, offset + session.chunkSize),
@@ -880,13 +1256,14 @@ async function uploadLocal(file, metadata) {
   }
 }
 async function uploadFiles(files) {
+  if (isOffline()) throw new Error("Connect to the server to upload media.");
   if (!files.length) return;
   if (
     state.uploads === "unconfigured" &&
     files.some((f) => !/\.m3u8?$/i.test(f.name))
   )
     throw new Error(
-      "Cloud uploads need a public Vercel Blob store. Connect it to this project and set BLOB_READ_WRITE_TOKEN, then redeploy.",
+      "Set UPSTASH_BLOB_TOKEN on the server to enable Upstash Blob uploads.",
     );
   closeModal();
   let count = 0;
@@ -915,25 +1292,32 @@ async function uploadFiles(files) {
         if (state.uploads === "disk") {
           m = await uploadLocal(file, metadata);
         } else {
-          if (state.uploads !== "blob")
+          if (state.uploads !== "upstash")
             throw new Error(
-              "Connect a public Vercel Blob store and set BLOB_READ_WRITE_TOKEN to enable uploads.",
+              "Set UPSTASH_BLOB_TOKEN to enable Upstash Blob uploads.",
             );
-          const { upload } = await import("./blob-client.js");
-          const pathname = `media/${crypto.randomUUID()}.${file.name.split(".").pop().toLowerCase()}`;
-          const result = await upload(pathname, file, {
-            access: "public",
-            multipart: true,
-            contentType: file.type || mimeFor(file.name),
-            handleUploadUrl: "/api/blob/upload",
-            clientPayload: JSON.stringify(metadata),
-            onUploadProgress: (p) =>
-              setSaveStatus(`Uploading ${Math.round(p.percentage)}%`),
+          const { upload } = await import("./upstash-upload.js");
+          const uploadFile = new File([file], file.name, {
+            type: mimeFor(file.name),
           });
-          m = await api("/api/media/blob-complete", {
-            method: "POST",
-            body: { url: result.url, pathname: result.pathname, metadata },
+          const task = upload(uploadFile, {
+            route: "/api/uploads/blob",
+            input: metadata,
           });
+          const unsubscribe = task.subscribe(() =>
+            setSaveStatus(`Uploading ${task.snapshot().percent}%`),
+          );
+          try {
+            const result = await task.done;
+            m =
+              result.data?.media ||
+              (await api("/api/media/upstash-complete", {
+                method: "POST",
+                body: { path: result.path },
+              }));
+          } finally {
+            unsubscribe();
+          }
         }
         if (!state.media.some((v) => v.id === m.id)) state.media.push(m);
       }
@@ -1045,6 +1429,98 @@ async function outputDevices() {
 }
 const actions = {
   "close-modal": () => closeModal(),
+  "rename-media": (button) => {
+    const m = media(button.dataset.id),
+      input = document.createElement("input");
+    input.className = "media-name-input";
+    input.value = m.filename;
+    input.setAttribute("aria-label", `File name for ${m.id}`);
+    input.maxLength = 180;
+    let done = false,
+      cancelled = false,
+      job;
+    const commit = () => {
+      if (done) return job;
+      done = true;
+      job = Promise.resolve().then(async () => {
+        try {
+          if (!cancelled && input.value !== m.filename) {
+            const values = renameMediaFile(m, input.value);
+            await queueChange(
+              state.user.username,
+              "media",
+              m.id,
+              "put",
+              values,
+            );
+            Object.assign(m, values);
+            await refreshPending();
+            await refreshMediaReferences(m);
+            await persistWorkspace();
+            if (!isOffline()) await syncPending();
+            const issue = state.pending.find(
+              (e) => e.kind === "media" && e.id === m.id && e.error,
+            );
+            if (issue) throw new Error(issue.error.message);
+          }
+          return !cancelled;
+        } catch (error) {
+          toast(error.message, true);
+          return false;
+        } finally {
+          localSaves.delete(`media:${m.id}`);
+          updateSyncStatus();
+          render();
+        }
+      });
+      localSaves.set(`media:${m.id}`, job);
+      updateSyncStatus();
+      return job;
+    };
+    input.commitRename = commit;
+    input.addEventListener("blur", commit, { once: true });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        input.blur();
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        cancelled = true;
+        input.blur();
+      }
+    });
+    button.replaceWith(input);
+    input.focus();
+    input.setSelectionRange(0, m.filename.length - m.extension.length - 1);
+  },
+  "sync-details": () =>
+    state.pending.length || state.authExpired
+      ? syncDetails()
+      : saveWorkspaceNow(),
+  "sync-now": async () => {
+    if (state.manualOffline) {
+      toast("Turn off Offline mode in settings to sync.");
+      return;
+    }
+    await retryChanges(state.user.username);
+    state.authExpired = false;
+    endpointMissing = false;
+    await probeConnection();
+    if (modal.open) syncDetails();
+  },
+  "sync-sign-in": () => {
+    closeModal();
+    showLogin();
+  },
+  "go-online": () => setOfflineMode(false),
+  "network-status": async () => {
+    if (state.manualOffline) settings();
+    else {
+      endpointMissing = false;
+      await probeConnection();
+    }
+  },
   "cue-config": (b) => cueConfig(b.dataset.cueId),
   settings,
   shortcuts: settings,
@@ -1053,6 +1529,7 @@ const actions = {
     prefs();
   },
   "edit-setting-value": (b) => {
+    assertEditable(current());
     const index = Number(b.dataset.index),
       setting = b.dataset.setting,
       c = current().cues[index],
@@ -1115,7 +1592,7 @@ const actions = {
   logout: async () => {
     await flushSaves();
     await api("/api/logout", { method: "POST" });
-    engine.stop();
+    engine.halt(true);
     await cacheDelete("meta", "workspace");
     closeModal();
     showLogin();
@@ -1164,7 +1641,7 @@ const actions = {
   "stop-cue": async (b) => {
     const i = Number(b.dataset.index);
     if (engine.index !== i) await engine.select(i);
-    engine.stop();
+    await engine.stop();
   },
   "select-cue": (b) => engine.select(Number(b.dataset.index)),
   toggle: () => engine.toggle(),
@@ -1214,11 +1691,11 @@ const actions = {
   },
   "duplicate-sequence": async (b) => {
     const s = state.sequences.find((v) => v.id === b.dataset.id),
-      copy = await api("/api/sequences", {
-        method: "POST",
-        body: { ...s, name: `${s.name} (copy)`, cues: duplicateCues(s.cues) },
+      copy = await createSequence({
+        ...s,
+        name: `${s.name} (copy)`,
+        cues: duplicateCues(s.cues),
       });
-    state.sequences.push(copy);
     closeModal();
     await selectSequence(copy.id);
     toast("Sequence duplicated.");
@@ -1247,8 +1724,11 @@ const actions = {
   "confirm-delete-sequence": async (b) => {
     const id = b.dataset.id;
     await flushSaves();
-    await api(`/api/sequences/${id}`, { method: "DELETE" });
-    if (current()?.id === id) engine.stop();
+    const removed = state.sequences.find((s) => s.id === id);
+    assertEditable(removed);
+    await queueChange(state.user.username, "sequence", id, "delete", removed);
+    await refreshPending();
+    if (current()?.id === id) engine.halt(true);
     state.sequences = state.sequences.filter((s) => s.id !== id);
     if (state.activeId === id) {
       state.activeId = state.sequences[0]?.id;
@@ -1260,9 +1740,15 @@ const actions = {
     state.selected.delete(id);
     closeModal();
     render();
-    toast("Sequence removed.");
+    if (!isOffline()) await syncPending();
+    toast(
+      isOffline()
+        ? "Sequence removed locally. Server deletion is queued."
+        : "Sequence removed.",
+    );
   },
   "cue-duplicate": async (b) => {
+    assertEditable(current());
     const s = current(),
       i = Number(b.dataset.index),
       activeId = engine.cue?.id;
@@ -1282,10 +1768,11 @@ const actions = {
     render();
   },
   "cue-remove": async (b) => {
+    assertEditable(current());
     const s = current(),
       i = Number(b.dataset.index),
       activeId = engine.cue?.id;
-    engine.stop();
+    engine.halt(true);
     s.cues.splice(i, 1);
     await saveSequence(s);
     await engine.select(
@@ -1324,6 +1811,8 @@ const actions = {
     );
   },
   "confirm-delete-media": async (b) => {
+    if (isOffline())
+      throw new Error("Connect to the server to delete media files.");
     const id = b.dataset.id;
     await api(`/api/media/${id}`, { method: "DELETE" });
     state.media = state.media.filter((m) => m.id !== id);
@@ -1351,10 +1840,7 @@ const actions = {
     closeModal();
     render();
   },
-  "retry-save": async () => {
-    for (const s of state.sequences) await saveSequence(s);
-    toast("Changes saved.");
-  },
+  "retry-save": () => saveWorkspaceNow(),
 };
 async function massCache(remove) {
   const type = state.view === "media" ? "media" : "sequence",
@@ -1377,6 +1863,7 @@ async function massCache(remove) {
   );
 }
 async function reorder(from, to) {
+  assertEditable(current());
   const s = current();
   if (from === to || to < 0 || to >= s.cues.length) return;
   const active = engine.cue?.id,
@@ -1398,6 +1885,15 @@ document.addEventListener("click", async (e) => {
     state.tab = tab.dataset.tab;
     render();
     if (state.tab === "player") await requestOutputAccess();
+    return;
+  }
+  const card = e.target.closest(".cue-card");
+  if (
+    card &&
+    !e.target.closest("button,input,select,textarea,label,a,[data-seek-index]")
+  ) {
+    const index = Number(card.dataset.index);
+    if (index !== engine.index) await engine.select(index);
     return;
   }
   const b = e.target.closest("[data-action]");
@@ -1521,6 +2017,17 @@ document.addEventListener("input", (e) => {
     setAccent(el.value);
     prefs();
   }
+  if (el.dataset.cueSetting && !canEdit(current())) {
+    render();
+    return;
+  }
+  if (el.dataset.cueSetting === "cueText") {
+    const cue = current()?.cues[Number(el.dataset.index)];
+    if (cue) {
+      cue.cueText = el.value.slice(0, 120);
+      scheduleSave(current());
+    }
+  }
   if (el.hasAttribute("data-master")) engine.setMaster(Number(el.value) / 100);
   if (["volume", "speed"].includes(el.dataset.cueSetting)) {
     const s = current(),
@@ -1543,6 +2050,10 @@ document.addEventListener("input", (e) => {
 document.addEventListener("change", async (e) => {
   const el = e.target;
   try {
+    if (el.id === "offline-mode-toggle") {
+      await setOfflineMode(el.checked);
+      return;
+    }
     if (el.id === "cue-loop-mode") {
       const counted = el.value === "count";
       $("#loop-count-label").classList.toggle("hidden", !counted);
@@ -1641,6 +2152,7 @@ document.addEventListener("submit", async (e) => {
   try {
     if (form.id === "cue-config-form") {
       const seq = current();
+      assertEditable(seq);
       if (seq?.id !== form.dataset.sequenceId)
         throw new Error("The active sequence has changed.");
       const index = seq.cues.findIndex((c) => c.id === form.dataset.cueId),
@@ -1659,7 +2171,18 @@ document.addEventListener("submit", async (e) => {
         (!Number.isInteger(loop) || loop < 1 || loop > 10000)
       )
         throw new Error("Enter 1–10,000 total plays.");
+      const fadeIn = Number(values.fadeIn),
+        fadeOut = Number(values.fadeOut);
+      if (
+        ![fadeIn, fadeOut].every(
+          (n) => Number.isFinite(n) && n >= 0 && n <= 3600,
+        )
+      )
+        throw new Error("Enter fade durations between 0 and 3600 seconds.");
       cue.loop = loop;
+      cue.fadeIn = fadeIn;
+      cue.fadeOut = fadeOut;
+      if (index === engine.index) engine.apply();
       if (next) {
         next.follow = values.linkNext === "on";
         next.followFrom = next.follow ? cue.id : null;
@@ -1672,25 +2195,22 @@ document.addEventListener("submit", async (e) => {
       const id = form.dataset.id;
       if (id) {
         const s = state.sequences.find((v) => v.id === id);
+        assertEditable(s);
         Object.assign(s, values);
         await saveSequence(s);
         closeModal();
         render();
       } else {
-        const s = await api("/api/sequences", {
-          method: "POST",
-          body: { ...values, cues: [] },
-        });
-        state.sequences.push(s);
+        const s = await createSequence({ ...values, cues: [] });
         closeModal();
         await selectSequence(s.id);
       }
     } else {
-      const m = await api(`/api/media/${form.dataset.id}`, {
-        method: "PATCH",
-        body: values,
-      });
-      Object.assign(media(m.id), m);
+      const m = media(form.dataset.id);
+      Object.assign(m, values);
+      await queueChange(state.user.username, "media", m.id, "put", values);
+      await refreshPending();
+      if (!isOffline()) await syncPending();
       await persistWorkspace();
       closeModal();
       render();
@@ -2016,30 +2536,26 @@ window.addEventListener("resize", () => {
 });
 window.addEventListener("scroll", positionVideo, true);
 window.addEventListener("offline", () => {
-  state.offline = true;
-  updateCacheStatus();
-  toast("You’re offline. Cached cues are ready to play.");
+  networkController.abort();
+  networkController = new AbortController();
+  markOffline();
 });
 window.addEventListener("online", () => {
-  state.offline = false;
-  updateCacheStatus();
-  toast("Back online. Your workspace is connected.");
+  if (!state.manualOffline) {
+    endpointMissing = false;
+    probeConnection();
+  } else updateConnectivity();
 });
-window.addEventListener("beforeunload", (e) => {
-  if (
-    saveTimers.size ||
-    saving.size ||
-    $("#save-status").textContent.includes("Retry")
-  ) {
-    e.preventDefault();
-    e.returnValue = "";
+window.addEventListener("beforeunload", (event) => {
+  if (localSaves.size) {
+    event.preventDefault();
+    event.returnValue = "";
   }
 });
-$("#save-status").dataset.action = "retry-save";
-$("#save-status").title = "Click to save all sequences";
+$("#save-status").dataset.action = "sync-details";
 $("#save-status").style.cursor = "pointer";
 function showLogin() {
-  engine.stop();
+  engine.halt(true);
   $("#login-screen").classList.remove("hidden");
   $("#login-form button").disabled = false;
   const wave = $(".login-wave");
@@ -2060,7 +2576,10 @@ $("#login-form").addEventListener("submit", async (e) => {
       method: "POST",
       body: Object.fromEntries(new FormData(e.target)),
     });
+    state.verifiedUser = state.user.username;
+    state.authExpired = false;
     await loadWorkspace();
+    await syncPending();
     $("#login-screen").classList.add("hidden");
   } catch (err) {
     $("#login-error").textContent = err.message;
@@ -2069,12 +2588,34 @@ $("#login-form").addEventListener("submit", async (e) => {
   }
 });
 async function loadWorkspace(cached = null) {
-  const data = cached || (await api("/api/workspace"));
-  state.media = data.media;
-  state.sequences = data.sequences;
+  const data = cached || (await api("/api/workspace")),
+    previous = await cacheGet("meta", "workspace");
+  if (data.user) state.user = data.user;
+  state.media = data.media || [];
+  state.sequences = data.sequences || [];
   state.database = data.database || "redis";
   state.uploads = data.uploads || "unconfigured";
-  if (data.user) state.user = data.user;
+  await refreshPending();
+  for (const old of previous?.sequences || [])
+    if (
+      state.cached.has(`sequence:${old.id}`) &&
+      !state.sequences.some((s) => s.id === old.id)
+    )
+      state.sequences.push(old);
+  let pendingPrefs = null;
+  for (const entry of state.pending) {
+    if (entry.kind === "sequence") {
+      const index = state.sequences.findIndex((s) => s.id === entry.id);
+      if (entry.operation === "delete") {
+        if (index >= 0) state.sequences.splice(index, 1);
+      } else if (index >= 0)
+        state.sequences[index] = structuredClone(entry.data);
+      else state.sequences.push(structuredClone(entry.data));
+    } else if (entry.kind === "media") {
+      const m = media(entry.id);
+      if (m) Object.assign(m, entry.data);
+    } else pendingPrefs = entry.data;
+  }
   let localPrefs = {};
   try {
     localPrefs = JSON.parse(localStorage.getItem("simplecue-prefs") || "{}");
@@ -2083,9 +2624,12 @@ async function loadWorkspace(cached = null) {
     ...state.prefs,
     ...localPrefs,
     ...data.preferences,
+    ...pendingPrefs,
     keybinds: {
       ...defaults,
-      ...(data.preferences?.keybinds || localPrefs.keybinds),
+      ...(pendingPrefs?.keybinds ||
+        data.preferences?.keybinds ||
+        localPrefs.keybinds),
     },
   };
   state.activeId =
@@ -2094,6 +2638,7 @@ async function loadWorkspace(cached = null) {
   setAccent(state.prefs.accent);
   setTheme(state.prefs.mode || "light");
   await refreshCache();
+  updateConnectivity();
   render();
   if (current()?.cues.length) await engine.select(0);
   await persistWorkspace();
@@ -2104,36 +2649,48 @@ async function boot() {
   navigator.mediaDevices?.addEventListener("devicechange", detectOutputs);
   try {
     await refreshCache();
-    let user;
-    try {
-      user = await api("/api/session");
-    } catch (e) {
-      if (
-        state.offline ||
-        !navigator.onLine ||
-        e.message.includes("Cannot reach")
-      ) {
-        const cached = await cacheGet("meta", "workspace");
-        if (cached?.user) {
-          state.offline = true;
-          await loadWorkspace(cached);
-          $("#login-screen").classList.add("hidden");
-          toast("Offline workspace restored. Play your cached cues.");
-          return;
-        }
+    updateConnectivity();
+    const cached = await cacheGet("meta", "workspace");
+    if (isOffline()) {
+      if (cached?.user) {
+        await loadWorkspace(cached);
+        $("#login-screen").classList.add("hidden");
+        return;
       }
       showLogin();
+      $("#login-error").textContent = "Connect to sign in for the first time.";
       return;
     }
-    state.user = user;
-    await loadWorkspace();
-  } catch (e) {
+    try {
+      state.user = await api("/api/session");
+      state.verifiedUser = state.user.username;
+      state.authExpired = false;
+      await loadWorkspace();
+      await syncPending();
+    } catch (error) {
+      if (error.offline && cached?.user) {
+        await loadWorkspace(cached);
+        $("#login-screen").classList.add("hidden");
+      } else {
+        showLogin();
+        if (error.status !== 401) $("#login-error").textContent = error.message;
+      }
+    }
+  } catch (error) {
     showLogin();
-    $("#login-error").textContent = e.message;
-    toast(e.message, true);
+    $("#login-error").textContent = error.message;
   } finally {
     if ("serviceWorker" in navigator)
-      navigator.serviceWorker.register("/sw.js").catch(() => {});
+      navigator.serviceWorker
+        .register("/sw.js")
+        .then(() => navigator.serviceWorker.ready)
+        .then(() =>
+          navigator.serviceWorker.controller?.postMessage({
+            type: "NETWORK_MODE",
+            offline: isOffline(),
+          }),
+        )
+        .catch(() => {});
   }
 }
 boot();

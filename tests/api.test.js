@@ -18,7 +18,7 @@ test("Express API: auth, uploads, M3U persistence and media integrity", async ()
       DATA_DIR: dir,
       UPSTASH_REDIS_REST_URL: "",
       UPSTASH_REDIS_REST_TOKEN: "",
-      BLOB_READ_WRITE_TOKEN: "",
+      UPSTASH_BLOB_TOKEN: "",
       VERCEL: "",
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -161,6 +161,41 @@ test("Express API: auth, uploads, M3U persistence and media integrity", async ()
       await call("/api/sequences/" + s.id + "/download")
     ).text();
     assert.match(text, /#EXTM3U/);
+    const renamedResponse = await call("/api/media/" + m.id, {
+      method: "PATCH",
+      body: { filename: "Renamed audio.wav" },
+    });
+    assert.equal(renamedResponse.status, 200);
+    const renamed = await renamedResponse.json();
+    assert.equal(renamed.id, m.id);
+    assert.equal(renamed.url, m.url);
+    assert.equal(renamed.storedFilename, m.storedFilename);
+    assert.equal(renamed.folder, m.folder);
+    assert.equal(renamed.filename, "Renamed audio.wav");
+    const renamedWs = await (await call("/api/workspace")).json();
+    const renamedSequence = renamedWs.sequences.find((seq) => seq.id === s.id);
+    assert.deepEqual(renamedSequence.cues[0], {
+      ...s.cues[0],
+      name: "Renamed audio",
+    });
+    const renamedM3u = await (
+      await call("/api/sequences/" + s.id + "/download")
+    ).text();
+    assert.match(renamedM3u, /\nRenamed audio\.wav\n/);
+    const renamedAudio = await fetch(base + renamed.url, {
+      headers: { cookie },
+    });
+    assert.deepEqual(Buffer.from(await renamedAudio.arrayBuffer()), sample);
+    assert.equal(
+      (
+        await call("/api/media/" + m.id, {
+          method: "PATCH",
+          body: { filename: "wrong.mp3" },
+        })
+      ).status,
+      400,
+    );
+    // The playlist exported before the rename must remain importable too.
     const imp = new FormData();
     imp.append("file", new Blob([text]), "test.m3u");
     const imported = await fetch(base + "/api/sequences/import", {

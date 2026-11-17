@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { build } from "esbuild";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, writeFile, rm } from "node:fs/promises";
 import { demoMedia } from "../server/seed.js";
 execFileSync(
   process.execPath,
@@ -16,15 +16,16 @@ execFileSync(
 );
 await build({
   stdin: {
-    contents: 'export {upload} from "@vercel/blob/client";',
+    contents: 'export {upload} from "@upstash/blob/browser";',
     resolveDir: process.cwd(),
   },
   bundle: true,
   format: "esm",
   minify: true,
-  outfile: "public/blob-client.js",
+  outfile: "public/upstash-upload.js",
   platform: "browser",
 });
+await rm("public/blob-client.js", { force: true });
 await mkdir("public/demo", { recursive: true });
 // Original synthesized demo audio, generated deterministically. No external assets.
 for (let j = 0; j < demoMedia.length; j++) {

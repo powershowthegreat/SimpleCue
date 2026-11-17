@@ -47,6 +47,13 @@
           <span id="save-status" class="save-status"
             ><i></i> All changes saved</span
           ><button
+            id="online-status"
+            class="online-status"
+            data-action="network-status"
+            title="Connection status"
+          >
+            <i></i>Online</button
+          ><button
             class="icon-button"
             id="theme-toggle"
             data-action="toggle-theme"
@@ -128,6 +135,14 @@
               required
           /></label>
           <div id="login-error" role="alert"></div>
+          <button
+            type="button"
+            id="login-offline-toggle"
+            class="button hidden"
+            data-action="go-online"
+          >
+            Turn off offline mode
+          </button>
           <button class="button button-dark w-full" type="submit">
             Open workspace <span data-icon="arrow-right"></span>
           </button>

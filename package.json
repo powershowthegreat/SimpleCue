@@ -15,16 +15,16 @@
     "node": ">=22"
   },
   "dependencies": {
-    "@vercel/blob": "^2.0.0",
+    "@upstash/blob": "^0.0.14",
     "cookie-parser": "^1.4.7",
     "express": "^5.1.0",
     "multer": "^2.0.2",
     "music-metadata": "^11.9.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.56.0",
     "@tailwindcss/cli": "^4.1.0",
-    "tailwindcss": "^4.1.0",
     "esbuild": "^0.25.0",
-    "@playwright/test": "^1.56.0"
+    "tailwindcss": "^4.1.0"
   }
 }

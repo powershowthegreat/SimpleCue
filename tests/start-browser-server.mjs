@@ -6,7 +6,7 @@ Object.assign(process.env, {
   DATA_DIR: dir,
   UPSTASH_REDIS_REST_URL: "",
   UPSTASH_REDIS_REST_TOKEN: "",
-  BLOB_READ_WRITE_TOKEN: "",
+  UPSTASH_BLOB_TOKEN: "",
   VERCEL: "",
 });
 const { default: app } = await import("../app.js");

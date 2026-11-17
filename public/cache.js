@@ -1,13 +1,25 @@
 let promise;
 export const db = () =>
   (promise ||= new Promise((resolve, reject) => {
-    const r = indexedDB.open("simplecue", 1);
+    const r = indexedDB.open("simplecue", 2);
     r.onupgradeneeded = () => {
-      for (const name of ["assets", "meta", "waves"])
+      for (const name of ["assets", "meta", "waves", "outbox"])
         if (!r.result.objectStoreNames.contains(name))
           r.result.createObjectStore(name);
     };
-    r.onsuccess = () => resolve(r.result);
+    r.onsuccess = () => {
+      r.result.onversionchange = () => {
+        r.result.close();
+        promise = undefined;
+      };
+      resolve(r.result);
+    };
+    r.onblocked = () =>
+      reject(
+        new Error(
+          "Close or reload other SimpleCue tabs to update offline storage.",
+        ),
+      );
     r.onerror = () => reject(r.error);
   }));
 export async function cacheGet(store, key) {
@@ -51,15 +63,55 @@ export async function cacheKeys(store) {
     r.onerror = () => reject(r.error);
   });
 }
+let networkEnabled = true;
+const unavailable = new Map();
+const sourceKey = (media) => `${media.id}:${media.url}`;
+export function setMediaNetworkEnabled(enabled) {
+  if (enabled && !networkEnabled) unavailable.clear();
+  networkEnabled = enabled;
+}
+export const mediaNetworkEnabled = () => networkEnabled && navigator.onLine;
+export const mediaUnavailable = (media) => unavailable.has(sourceKey(media));
+export function markMediaUnavailable(media) {
+  unavailable.set(sourceKey(media), true);
+}
+export async function cacheUpdate(store, key, update) {
+  const d = await db();
+  return new Promise((resolve, reject) => {
+    const tx = d.transaction(store, "readwrite"),
+      table = tx.objectStore(store),
+      request = table.get(key);
+    let value;
+    request.onsuccess = () => {
+      try {
+        value = update(request.result);
+        if (value === undefined) table.delete(key);
+        else table.put(value, key);
+      } catch (e) {
+        tx.abort();
+        reject(e);
+      }
+    };
+    tx.oncomplete = () => resolve(value);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () =>
+      reject(tx.error || new Error("Local storage update failed."));
+  });
+}
 export async function mediaBlob(media) {
   const cached = await cacheGet("assets", `media:${media.id}`);
   if (cached) return cached;
-  const r = await fetch(media.url);
-  if (!r.ok)
-    throw new Error(
-      "Media unavailable. Connect to the server or cache this file first.",
-    );
-  return r.blob();
+  if (!mediaNetworkEnabled())
+    throw new Error("This media is not cached on this device.");
+  if (mediaUnavailable(media))
+    throw new Error("This media is unavailable on the server.");
+  const response = await fetch(media.url);
+  if (!response.ok) {
+    if (response.status === 404 || response.status === 410)
+      markMediaUnavailable(media);
+    throw new Error("Media unavailable. Reconnect or refresh its server copy.");
+  }
+  return response.blob();
 }
 const inFlight = new Map();
 export function peaks(media) {

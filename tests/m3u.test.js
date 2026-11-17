@@ -110,3 +110,32 @@ test("gain up to 200 and counted/forever loops survive M3U round trips", () => {
       /Loop count/,
     );
 });
+
+test("cue words and independent fades persist in M3U and reject invalid durations", () => {
+  const clean = {
+    ...validateSequence(
+      {
+        ...seq,
+        cues: [
+          { ...seq.cues[0], cueText: "GO NOW", fadeIn: 1.25, fadeOut: 2.34 },
+        ],
+      },
+      media,
+    ),
+    id: "cue-fade-test",
+  };
+  assert.deepEqual(parse(serialize(clean, media), media), clean);
+  assert.equal(clean.cues[0].cueText, "GO NOW");
+  assert.equal(clean.cues[0].fadeIn, 1.25);
+  assert.equal(clean.cues[0].fadeOut, 2.34);
+  for (const field of ["fadeIn", "fadeOut"])
+    for (const n of [-1, Infinity, 3601, "bad"])
+      assert.throws(
+        () =>
+          validateSequence(
+            { ...seq, cues: [{ ...seq.cues[0], [field]: n }] },
+            media,
+          ),
+        /Fade durations/,
+      );
+});

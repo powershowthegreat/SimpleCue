@@ -1,4 +1,9 @@
-import { cacheGet } from "./cache.js";
+import {
+  cacheGet,
+  mediaNetworkEnabled,
+  mediaUnavailable,
+  markMediaUnavailable,
+} from "./cache.js";
 export class CueEngine extends EventTarget {
   constructor(getSequence, getMedia) {
     super();
@@ -15,6 +20,9 @@ export class CueEngine extends EventTarget {
     this.finishing = false;
     this.iteration = 1;
     this.frameId = null;
+    this.fadeState = {};
+    this.pauseState = null;
+    this.manualPause = false;
     this.el = document.createElement("video");
     this.el.preload = "auto";
     this.el.playsInline = true;
@@ -27,6 +35,9 @@ export class CueEngine extends EventTarget {
     this.output.dataset.simplecueOutput = "";
     document.body.append(this.output);
     this.el.addEventListener("timeupdate", () => this.tick());
+    this.el.addEventListener("playing", () => {
+      if (!this.pausing) this.scheduleEndFade();
+    });
     this.el.addEventListener("ended", () => {
       if (this.el.ended) this.end();
     });
@@ -40,10 +51,13 @@ export class CueEngine extends EventTarget {
       this.emit();
     });
     this.el.addEventListener("error", () => {
-      if (this.el.error)
+      if (this.el.error) {
+        const m = this.getMedia(this.cue?.mediaId);
+        if (m && mediaNetworkEnabled()) markMediaUnavailable(m);
         this.error(
           "This media cannot be played by this browser. Check the file format.",
         );
+      }
     });
   }
   get cue() {
@@ -98,22 +112,107 @@ export class CueEngine extends EventTarget {
       this.source = this.audioContext.createMediaElementSource(this.el);
       this.gainNode = this.audioContext.createGain();
       this.audioDestination = this.audioContext.createMediaStreamDestination();
+      this.fadeInNode = this.audioContext.createGain();
+      this.fadeOutNode = this.audioContext.createGain();
       this.source.connect(this.gainNode);
-      this.gainNode.connect(this.audioDestination);
+      this.gainNode.connect(this.fadeInNode);
+      this.fadeInNode.connect(this.fadeOutNode);
+      this.fadeOutNode.connect(this.audioDestination);
       this.output.srcObject = this.audioDestination.stream;
       if (this.sinkId && this.output.setSinkId)
         await this.output.setSinkId(this.sinkId);
     }
-    this.apply();
+    this.apply(false);
     await this.audioContext.resume();
     if (this.output.paused) await this.output.play();
   }
-  async play() {
-    const generation = this.generation;
-    await this.prepareAudio();
-    if (generation === this.generation && !this.loading) await this.el.play();
+  get pausing() {
+    return Boolean(this.pauseState);
   }
-  apply() {
+  fadeLevel(name) {
+    const state = this.fadeState[name];
+    if (!state) return 1;
+    const now = this.audioContext.currentTime;
+    if (now <= state.start) return state.from;
+    if (now >= state.end) return state.to;
+    return (
+      state.from +
+      ((state.to - state.from) * (now - state.start)) /
+        (state.end - state.start)
+    );
+  }
+  setFade(name, from, to, duration, delay = 0) {
+    if (!this.audioContext) return;
+    const node = name === "in" ? this.fadeInNode : this.fadeOutNode,
+      now = this.audioContext.currentTime;
+    node.gain.cancelScheduledValues(now);
+    node.gain.setValueAtTime(from, now);
+    if (delay > 0) node.gain.setValueAtTime(from, now + delay);
+    if (duration > 0)
+      node.gain.linearRampToValueAtTime(to, now + delay + duration);
+    else node.gain.setValueAtTime(to, now + delay);
+    this.fadeState[name] = {
+      from,
+      to,
+      start: now + delay,
+      end: now + delay + duration,
+    };
+  }
+  scheduleEndFade() {
+    if (!this.audioContext || !this.cue || this.pausing) return 1;
+    const remaining = Math.max(
+        0,
+        (this.cue.end - this.el.currentTime) / (this.cue.speed || 1),
+      ),
+      duration = Math.min(
+        this.cue.fadeOut || 0,
+        (this.cue.end - this.cue.start) / (this.cue.speed || 1),
+      );
+    const from = duration > 0 ? Math.min(1, remaining / duration) : 1;
+    this.setFade(
+      "out",
+      from,
+      duration > 0 ? 0 : 1,
+      Math.min(duration, remaining),
+      Math.max(0, remaining - duration),
+    );
+    return from;
+  }
+  cancelPause() {
+    const pending = this.pauseState;
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.pauseState = null;
+      pending.resolve();
+    }
+  }
+  async play() {
+    const generation = this.generation,
+      wasPlaying = this.playing,
+      level = this.audioContext
+        ? this.fadeLevel("in") * this.fadeLevel("out")
+        : 0;
+    this.cancelPause();
+    await this.prepareAudio();
+    if (generation !== this.generation || this.loading) return;
+    const out = this.scheduleEndFade(),
+      from = wasPlaying ? Math.min(1, level / Math.max(0.0001, out)) : 0;
+    this.setFade(
+      "in",
+      this.cue.fadeIn > 0 ? from : 1,
+      1,
+      Math.min(
+        this.cue.fadeIn || 0,
+        Math.max(
+          0,
+          (this.cue.end - this.el.currentTime) / (this.cue.speed || 1),
+        ),
+      ),
+    );
+    this.manualPause = false;
+    await this.el.play();
+  }
+  apply(reschedule = true) {
     const c = this.cue;
     if (!c) return;
     const gain = (this.master * (c.volume ?? 100)) / 100;
@@ -127,17 +226,71 @@ export class CueEngine extends EventTarget {
       this.el.muted = this.muted;
     }
     if (c.speed === 0) {
-      this.el.pause();
-      this.el.playbackRate = 1;
+      if (this.playing && !this.pausing) this.pause();
     } else this.el.playbackRate = c.speed;
     if (this.el.currentTime < c.start || this.el.currentTime > c.end)
       this.el.currentTime = c.start;
+    if (reschedule && this.playing && !this.pausing) this.scheduleEndFade();
+  }
+  finishPause(pending) {
+    if (this.pauseState !== pending) return;
+    clearTimeout(pending.timer);
+    this.pauseState = null;
+    this.el.pause();
+    this.setFade("out", 0, 0, 0);
+    if (pending.reset) {
+      this.iteration = 1;
+      this.seek(0);
+    }
+    this.emit();
+    pending.resolve();
+  }
+  pause(reset = false) {
+    this.manualPause = true;
+    if (this.pauseState) {
+      this.pauseState.reset ||= reset;
+      return this.pauseState.promise;
+    }
+    const duration = Math.min(
+      this.cue?.fadeOut || 0,
+      Math.max(
+        0,
+        ((this.cue?.end || 0) - this.el.currentTime) /
+          (this.el.playbackRate || 1),
+      ),
+    );
+    if (!this.playing || !this.audioContext || duration <= 0) {
+      this.halt(reset);
+      return Promise.resolve();
+    }
+    const pending = { reset };
+    pending.promise = new Promise((resolve) => (pending.resolve = resolve));
+    this.pauseState = pending;
+    this.setFade("in", this.fadeLevel("in"), this.fadeLevel("in"), 0);
+    this.setFade("out", this.fadeLevel("out"), 0, duration);
+    pending.timer = setTimeout(
+      () => this.finishPause(pending),
+      duration * 1000,
+    );
+    this.emit();
+    return pending.promise;
+  }
+  halt(reset = false) {
+    this.manualPause = true;
+    this.cancelPause();
+    this.el.pause();
+    this.setFade("out", 0, 0, 0);
+    if (reset) {
+      this.iteration = 1;
+      this.seek(0);
+    }
+    this.emit();
   }
   async select(index, autoplay = false) {
     const generation = ++this.generation;
     this.finishing = false;
     this.iteration = 1;
-    this.el.pause();
+    this.halt();
     const seq = this.getSequence();
     if (!seq?.cues.length) {
       this.index = 0;
@@ -158,6 +311,13 @@ export class CueEngine extends EventTarget {
     try {
       const blob = await cacheGet("assets", `media:${m.id}`);
       if (generation !== this.generation) return;
+      if (!blob && (!mediaNetworkEnabled() || mediaUnavailable(m))) {
+        this.loading = false;
+        this.el.removeAttribute("src");
+        this.el.load();
+        this.emit();
+        return;
+      }
       if (this.url) URL.revokeObjectURL(this.url);
       this.url = blob ? URL.createObjectURL(blob) : null;
       this.el.src = this.url || m.url;
@@ -205,7 +365,7 @@ export class CueEngine extends EventTarget {
       return;
     }
     if (this.loading) return;
-    if (this.playing) this.el.pause();
+    if (this.playing && !this.pausing) await this.pause();
     else
       try {
         if (!this.el.src) return await this.select(this.index, true);
@@ -220,6 +380,11 @@ export class CueEngine extends EventTarget {
       }
   }
   async end() {
+    if (this.pauseState) {
+      this.finishPause(this.pauseState);
+      return;
+    }
+    if (this.manualPause) return;
     if (this.finishing || this.loading || !this.cue) return;
     this.finishing = true;
     const generation = this.generation,
@@ -260,6 +425,7 @@ export class CueEngine extends EventTarget {
         this.cue.start +
         Math.max(0, Math.min(1, ratio)) * (this.cue.end - this.cue.start);
       this.finished = false;
+      if (this.playing && !this.pausing) this.scheduleEndFade();
       this.dispatchEvent(new Event("time"));
     }
   }
@@ -272,10 +438,7 @@ export class CueEngine extends EventTarget {
     this.emit();
   }
   stop() {
-    this.el.pause();
-    this.iteration = 1;
-    this.seek(0);
-    this.emit();
+    return this.pause(true);
   }
   setMaster(value) {
     this.master = Math.max(0, Math.min(2, value));

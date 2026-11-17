@@ -34,6 +34,8 @@ export function parse(text, media = {}) {
         Object.values(media).find(
           (m) =>
             m.filename === l ||
+            m.aliases?.includes(l) ||
+            m.aliases?.includes(l.split("/").pop()) ||
             m.name === l ||
             m.url === l ||
             m.filename === l.split("/").pop(),
@@ -97,6 +99,15 @@ export function validateSequence(input, media) {
         (!Number.isInteger(loop) || loop < 1 || loop > 10000)
       )
         throw new Error("Loop count must be 1–10,000 total plays or forever.");
+      const fadeIn = num(c.fadeIn, 0),
+        fadeOut = num(c.fadeOut, 0);
+      if (
+        ![fadeIn, fadeOut].every(
+          (n) => Number.isFinite(n) && n >= 0 && n <= 3600,
+        )
+      )
+        throw new Error("Fade durations must be between 0 and 3600 seconds.");
+      const cueText = String(c.cueText || "").slice(0, 120);
       const previous = source[index - 1]?.id;
       const from =
         c.followFrom === undefined && c.follow ? previous : c.followFrom;
@@ -108,6 +119,9 @@ export function validateSequence(input, media) {
         volume,
         speed,
         loop,
+        cueText,
+        fadeIn,
+        fadeOut,
         start,
         end,
         follow: linked,
