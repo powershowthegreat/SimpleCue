@@ -526,6 +526,10 @@ test("cue configuration persists loops and next linkage, and direct header actio
   );
   await expect(page.locator(".active-cue")).toHaveAttribute("data-index", "0");
   await source().locator('[data-action="stop-cue"]').click();
+  expect(await page.locator("body > video").evaluate((el) => el.paused)).toBe(
+    true,
+  );
+  await source().locator('[data-action="reset-cue"]').click();
   await expect(source().locator("[data-track-elapsed]")).toHaveText("00:01.00");
   await source()
     .getByRole("button", { name: /Configure/ })
@@ -632,6 +636,8 @@ test("cue and master gain amplify the actual output above 100 percent", async ({
   await page.locator('[data-tab="player"]').click();
   const master = page.getByRole("slider", { name: "Master output gain" });
   await expect(master).toHaveAttribute("max", "200");
+  await expect(master).toHaveValue("100");
+  await expect(page.locator("[data-master-label]")).toHaveText("100");
   await master.evaluate((el) => {
     el.value = "100";
     el.dispatchEvent(new Event("input", { bubbles: true }));
@@ -813,7 +819,7 @@ test("cue words persist beside file types and clicking a track selects it withou
   await page.request.delete("/api/sequences/" + seq.id);
 });
 
-test("fade in, natural fade out, pause and stop ramp the audible output and preserve crop positions", async ({
+test("fades support pause, resume during fade, and immediate stop at the current position", async ({
   page,
 }) => {
   await signIn(page);
@@ -833,6 +839,7 @@ test("fade in, natural fade out, pause and stop ramp the audible output and pres
             speed: 1,
             fadeIn: 1.2,
             fadeOut: 0.6,
+            fadeOutAtPause: 0.6,
           },
           {
             id: "fade-b",
@@ -874,7 +881,7 @@ test("fade in, natural fade out, pause and stop ramp the audible output and pres
       return Math.sqrt(a.reduce((sum, n) => sum + n * n, 0) / a.length);
     };
   });
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(100);
   const early = await page.evaluate(() => window.fadeRms());
   await page.waitForFunction(
     () => document.querySelector("body > video").currentTime > 2.5,
@@ -886,12 +893,31 @@ test("fade in, natural fade out, pause and stop ramp the audible output and pres
   await expect(source().locator("[data-track-status]")).toHaveText(
     "Fading out",
   );
+  await expect(source().locator('[data-action="play-cue"]')).toHaveAttribute(
+    "aria-label",
+    /^Play /,
+  );
+  await expect(source()).not.toHaveClass(/\bplaying\b/);
   expect(await page.locator("body > video").evaluate((el) => el.paused)).toBe(
     false,
   );
   await page.waitForTimeout(200);
   const fading = await page.evaluate(() => window.fadeRms());
   expect(fading).toBeLessThan(full * 0.9);
+  await source().locator('[data-action="play-cue"]').click();
+  await expect(source().locator('[data-action="play-cue"]')).toHaveAttribute(
+    "aria-label",
+    /^Pause /,
+  );
+  await expect(source().locator("[data-track-status]")).toHaveText("Playing");
+  await expect(source()).toHaveClass(/\bplaying\b/);
+  // Wait past the cancelled pause deadline and the resumed fade in.
+  await page.waitForTimeout(1300);
+  expect(await page.locator("body > video").evaluate((el) => el.paused)).toBe(
+    false,
+  );
+  expect(await page.evaluate(() => window.fadeRms())).toBeGreaterThan(0.01);
+  await source().locator('[data-action="play-cue"]').click();
   await expect
     .poll(() => page.locator("body > video").evaluate((el) => el.paused))
     .toBe(true);
@@ -899,17 +925,32 @@ test("fade in, natural fade out, pause and stop ramp the audible output and pres
   expect(await page.evaluate(() => window.fadeRms())).toBeLessThan(0.002);
   await source().locator('[data-action="play-cue"]').click();
   await page.waitForTimeout(1300);
-  await source().locator('[data-action="stop-cue"]').click();
-  await expect(source().locator("[data-track-status]")).toHaveText(
-    "Fading out",
-  );
+  const stoppedAt = await source()
+    .locator('[data-action="stop-cue"]')
+    .evaluate((button) => {
+      button.click();
+      const el = document.querySelector("body > video");
+      if (!el.paused) throw new Error("Stop must pause immediately");
+      return el.currentTime;
+    });
+  expect(stoppedAt).toBeGreaterThan(2.5);
+  await page.waitForTimeout(700);
+  expect(
+    await page.locator("body > video").evaluate((el) => el.currentTime),
+  ).toBe(stoppedAt);
+  expect(await page.evaluate(() => window.fadeRms())).toBeLessThan(0.002);
+  // Stop also wins if Play is still preparing the audio output.
+  await source().evaluate((card) => {
+    card.querySelector('[data-action="play-cue"]').click();
+    card.querySelector('[data-action="stop-cue"]').click();
+  });
+  await page.waitForTimeout(150);
   expect(await page.locator("body > video").evaluate((el) => el.paused)).toBe(
-    false,
+    true,
   );
-  await expect
-    .poll(() => page.locator("body > video").evaluate((el) => el.paused))
-    .toBe(true);
-  await expect(source().locator("[data-track-elapsed]")).toHaveText("00:01.00");
+  expect(
+    await page.locator("body > video").evaluate((el) => el.currentTime),
+  ).toBe(stoppedAt);
   await source()
     .getByRole("button", { name: /Configure/ })
     .click();
@@ -917,7 +958,24 @@ test("fade in, natural fade out, pause and stop ramp the audible output and pres
   await expect(
     page.getByRole("spinbutton", { name: "Fade out (seconds)" }),
   ).toHaveValue("0.6");
+  await page
+    .getByRole("spinbutton", { name: "Fade out at pause (seconds)" })
+    .fill("0");
   await page.getByRole("button", { name: "Save configuration" }).click();
+  await source().locator('[data-action="play-cue"]').click();
+  // An end fade alone must not delay Pause.
+  const pausedAt = await source()
+    .locator('[data-action="play-cue"]')
+    .evaluate((button) => {
+      button.click();
+      const el = document.querySelector("body > video");
+      if (!el.paused) throw new Error("Pause fade is disabled");
+      return el.currentTime;
+    });
+  await page.waitForTimeout(150);
+  expect(
+    await page.locator("body > video").evaluate((el) => el.currentTime),
+  ).toBe(pausedAt);
   await source().locator('[data-action="play-cue"]').click();
   const rect = await source().locator(".wave-wrap").boundingBox();
   await page.mouse.click(
@@ -939,16 +997,49 @@ test("fade in, natural fade out, pause and stop ramp the audible output and pres
     .getByRole("button", { name: /Configure/ })
     .click();
   await page.getByRole("radio", { name: "On", exact: true }).check();
+  await page.getByRole("spinbutton", { name: "Fade out (seconds)" }).fill("0");
+  await page
+    .getByRole("spinbutton", { name: "Fade out at pause (seconds)" })
+    .fill("0.6");
   await page.getByRole("button", { name: "Save configuration" }).click();
+  await expect(source().locator(".cue-modifiers")).toContainText(
+    "fade out at pause 0.6s",
+  );
   await source().locator('[data-action="play-cue"]').click();
+  await page.waitForFunction(
+    () => !document.querySelector("body > video").paused,
+  );
   const near = await source().locator(".wave-wrap").boundingBox();
   await page.mouse.click(
-    near.x + (near.width * 11.7) / m.duration,
+    near.x + (near.width * 11.1) / m.duration,
     near.y + near.height / 2,
   );
-  await source().locator('[data-action="stop-cue"]').click();
-  await expect(source().locator("[data-track-elapsed]")).toHaveText("00:01.00");
-  await page.waitForTimeout(500);
+  await page.waitForTimeout(150);
+  const pauseOnlyBeforeEnd = await page.evaluate(() => window.fadeRms());
+  expect(pauseOnlyBeforeEnd).toBeGreaterThan(0.01);
+  await page.waitForFunction(
+    () => document.querySelector("body > video").currentTime > 11.65,
+  );
+  // A pause fade alone must leave the end of playback at full volume.
+  expect(await page.evaluate(() => window.fadeRms())).toBeGreaterThan(
+    pauseOnlyBeforeEnd * 0.7,
+  );
+  // Stop during a pause fade near the Out point must cancel its timer and linkage.
+  const stoppedDuringFade = await source().evaluate((card) => {
+    card.querySelector('[data-action="play-cue"]').click();
+    if (document.querySelector("body > video").paused)
+      throw new Error("The independent pause fade must start before stopping");
+    card.querySelector('[data-action="stop-cue"]').click();
+    const el = document.querySelector("body > video");
+    if (!el.paused)
+      throw new Error("Stop must interrupt the pause fade immediately");
+    return el.currentTime;
+  });
+  expect(stoppedDuringFade).toBeGreaterThan(11);
+  await page.waitForTimeout(700);
+  expect(
+    await page.locator("body > video").evaluate((el) => el.currentTime),
+  ).toBe(stoppedDuringFade);
   await expect(page.locator(".active-cue")).toHaveAttribute("data-index", "0");
   expect(await page.locator("body > video").evaluate((el) => el.paused)).toBe(
     true,
@@ -979,6 +1070,7 @@ test("offline mode keeps cached edits and file renames across reload, then syncs
             cueText: "Original",
             fadeIn: 0.2,
             fadeOut: 0.3,
+            fadeOutAtPause: 0.4,
           },
         ],
       },
@@ -1023,6 +1115,11 @@ test("offline mode keeps cached edits and file renames across reload, then syncs
     .fill("00:01:25");
   await page.keyboard.press("Control+s");
   await expect(page.locator("#save-status")).toContainText("Saved locally");
+  await page.getByRole("button", { name: /Configure/ }).first().click();
+  await page
+    .getByRole("spinbutton", { name: "Fade out at pause (seconds)" })
+    .fill("0.7");
+  await page.getByRole("button", { name: "Save configuration" }).click();
   await page.locator('[data-tab="media"]').click();
   await page.locator(`[data-action="rename-media"][data-id="${m.id}"]`).click();
   const name = page.getByRole("textbox", { name: `File name for ${m.id}` });
@@ -1045,6 +1142,9 @@ test("offline mode keeps cached edits and file renames across reload, then syncs
     page.getByRole("textbox", { name: "Crop in for cue 1" }),
   ).toHaveValue("00:01:25");
   await expect(page.locator(".cue-name").first()).toHaveText("Renamed offline");
+  await expect(page.locator(".cue-modifiers").first()).toContainText(
+    "fade out at pause 0.7s",
+  );
   await page.locator('[data-action="play-cue"]').first().click();
   await expect
     .poll(() => page.locator("body > video").evaluate((el) => el.currentTime))
@@ -1077,6 +1177,7 @@ test("offline mode keeps cached edits and file renames across reload, then syncs
     cueText: "Stand by",
     fadeIn: 0.2,
     fadeOut: 0.3,
+    fadeOutAtPause: 0.7,
   });
   expect(after.media.find((x) => x.id === m.id).url).toBe(m.url);
   const exported = await (

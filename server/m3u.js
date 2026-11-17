@@ -100,9 +100,10 @@ export function validateSequence(input, media) {
       )
         throw new Error("Loop count must be 1–10,000 total plays or forever.");
       const fadeIn = num(c.fadeIn, 0),
-        fadeOut = num(c.fadeOut, 0);
+        fadeOut = num(c.fadeOut, 0),
+        fadeOutAtPause = num(c.fadeOutAtPause, 0);
       if (
-        ![fadeIn, fadeOut].every(
+        ![fadeIn, fadeOut, fadeOutAtPause].every(
           (n) => Number.isFinite(n) && n >= 0 && n <= 3600,
         )
       )
@@ -122,6 +123,7 @@ export function validateSequence(input, media) {
         cueText,
         fadeIn,
         fadeOut,
+        fadeOutAtPause,
         start,
         end,
         follow: linked,

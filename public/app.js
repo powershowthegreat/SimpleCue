@@ -44,6 +44,8 @@ function modifierSummary(c, index) {
   if (linkedToNext(c, index)) parts.push("autoplay next");
   if (c.fadeIn > 0) parts.push(`fade in ${c.fadeIn}s`);
   if (c.fadeOut > 0) parts.push(`fade out ${c.fadeOut}s`);
+  if (c.fadeOutAtPause > 0)
+    parts.push(`fade out at pause ${c.fadeOutAtPause}s`);
   return parts.join(" | ");
 }
 function normalizeLinks(s) {
@@ -591,7 +593,7 @@ function updateEngineUI() {
   $$(".cue-card").forEach((e) => {
     const active = Number(e.dataset.index) === engine.index;
     e.classList.toggle("active-cue", active);
-    e.classList.toggle("playing", active && engine.playing);
+    e.classList.toggle("playing", active && engine.playing && !engine.pausing);
     const p = e.querySelector('[data-action="play-cue"]');
     if (p) {
       p.innerHTML = icon(
@@ -699,8 +701,8 @@ function cueConfig(cueId) {
     <fieldset class="cue-option-group"><legend>Linkage: to next</legend><div class="cue-link-options"><label><input type="radio" name="linkNext" value="off" ${!on ? "checked" : ""}> Off</label><label><input type="radio" name="linkNext" value="on" ${on ? "checked" : ""} ${!next ? "disabled" : ""}> On</label></div><div class="settings-note">${next ? `Next: ${esc(media(next.mediaId).name)}` : "Last cue — no next track."}</div></fieldset>
     <label class="form-label">Loop<select name="loopMode" id="cue-loop-mode"><option value="off" ${mode === "off" ? "selected" : ""}>Off</option><option value="count" ${mode === "count" ? "selected" : ""}>N times</option><option value="forever" ${mode === "forever" ? "selected" : ""}>Forever</option></select></label>
     <label class="form-label ${mode === "count" ? "" : "hidden"}" id="loop-count-label">Number of plays<input type="number" name="loopCount" min="1" max="10000" step="1" value="${typeof loop === "number" && loop > 1 ? loop : 2}" ${mode !== "count" ? "disabled" : ""} required><span class="settings-note">Total plays, including the first.</span></label>
-    <div class="fade-options"><label class="form-label">Fade in (seconds)<input type="number" name="fadeIn" min="0" max="3600" step=".01" value="${c.fadeIn || 0}" required></label><label class="form-label">Fade out (seconds)<input type="number" name="fadeOut" min="0" max="3600" step=".01" value="${c.fadeOut || 0}" required></label></div>
-    <p class="settings-note">Zero disables a fade. Fade out applies before the Out point and before pausing or stopping; fade lengths are limited to available playback time.</p>
+    <div class="fade-options"><label class="form-label">Fade in (seconds)<input type="number" name="fadeIn" min="0" max="3600" step=".01" value="${c.fadeIn || 0}" required></label><label class="form-label">Fade out (seconds)<input type="number" name="fadeOut" min="0" max="3600" step=".01" value="${c.fadeOut || 0}" required></label><label class="form-label">Fade out at pause (seconds)<input type="number" name="fadeOutAtPause" min="0" max="3600" step=".01" value="${c.fadeOutAtPause || 0}" required></label></div>
+    <p class="settings-note">Zero disables a fade. Fade out applies only before the Out point. Fade out at pause applies only when pausing. Press Play during a pause fade to resume. Stop silences immediately and keeps the current position; Reset returns to the In point. Fade lengths are limited to available playback time.</p>
     <p class="settings-note">Loops use the In/Out range. Linked playback starts after the final play. Forever keeps this cue active until stopped or another cue is selected.</p>
     <div id="form-error" class="form-error"></div><button class="button button-dark w-full" type="submit">Save configuration ${icon("check")}</button>
   </form>`,
@@ -2172,9 +2174,10 @@ document.addEventListener("submit", async (e) => {
       )
         throw new Error("Enter 1–10,000 total plays.");
       const fadeIn = Number(values.fadeIn),
-        fadeOut = Number(values.fadeOut);
+        fadeOut = Number(values.fadeOut),
+        fadeOutAtPause = Number(values.fadeOutAtPause);
       if (
-        ![fadeIn, fadeOut].every(
+        ![fadeIn, fadeOut, fadeOutAtPause].every(
           (n) => Number.isFinite(n) && n >= 0 && n <= 3600,
         )
       )
@@ -2182,6 +2185,7 @@ document.addEventListener("submit", async (e) => {
       cue.loop = loop;
       cue.fadeIn = fadeIn;
       cue.fadeOut = fadeOut;
+      cue.fadeOutAtPause = fadeOutAtPause;
       if (index === engine.index) engine.apply();
       if (next) {
         next.follow = values.linkNext === "on";

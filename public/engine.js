@@ -10,11 +10,12 @@ export class CueEngine extends EventTarget {
     this.getSequence = getSequence;
     this.getMedia = getMedia;
     this.index = 0;
-    this.master = 0.8;
+    this.master = 1;
     this.muted = false;
     this.sinkId = "";
     this.url = null;
     this.generation = 0;
+    this.playRequest = 0;
     this.loading = false;
     this.finished = false;
     this.finishing = false;
@@ -188,13 +189,19 @@ export class CueEngine extends EventTarget {
   }
   async play() {
     const generation = this.generation,
+      request = ++this.playRequest,
       wasPlaying = this.playing,
       level = this.audioContext
         ? this.fadeLevel("in") * this.fadeLevel("out")
         : 0;
     this.cancelPause();
     await this.prepareAudio();
-    if (generation !== this.generation || this.loading) return;
+    if (
+      generation !== this.generation ||
+      request !== this.playRequest ||
+      this.loading
+    )
+      return;
     const out = this.scheduleEndFade(),
       from = wasPlaying ? Math.min(1, level / Math.max(0.0001, out)) : 0;
     this.setFade(
@@ -211,6 +218,8 @@ export class CueEngine extends EventTarget {
     );
     this.manualPause = false;
     await this.el.play();
+    // Resuming a pause fade keeps the element playing, so no new play event fires.
+    if (request === this.playRequest) this.emit();
   }
   apply(reschedule = true) {
     const c = this.cue;
@@ -246,13 +255,14 @@ export class CueEngine extends EventTarget {
     pending.resolve();
   }
   pause(reset = false) {
+    this.playRequest++;
     this.manualPause = true;
     if (this.pauseState) {
       this.pauseState.reset ||= reset;
       return this.pauseState.promise;
     }
     const duration = Math.min(
-      this.cue?.fadeOut || 0,
+      this.cue?.fadeOutAtPause || 0,
       Math.max(
         0,
         ((this.cue?.end || 0) - this.el.currentTime) /
@@ -276,6 +286,7 @@ export class CueEngine extends EventTarget {
     return pending.promise;
   }
   halt(reset = false) {
+    this.playRequest++;
     this.manualPause = true;
     this.cancelPause();
     this.el.pause();
@@ -438,7 +449,7 @@ export class CueEngine extends EventTarget {
     this.emit();
   }
   stop() {
-    return this.pause(true);
+    this.halt();
   }
   setMaster(value) {
     this.master = Math.max(0, Math.min(2, value));

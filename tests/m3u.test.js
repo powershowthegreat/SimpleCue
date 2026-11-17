@@ -117,7 +117,13 @@ test("cue words and independent fades persist in M3U and reject invalid duration
       {
         ...seq,
         cues: [
-          { ...seq.cues[0], cueText: "GO NOW", fadeIn: 1.25, fadeOut: 2.34 },
+          {
+            ...seq.cues[0],
+            cueText: "GO NOW",
+            fadeIn: 1.25,
+            fadeOut: 2.34,
+            fadeOutAtPause: 0.75,
+          },
         ],
       },
       media,
@@ -128,7 +134,15 @@ test("cue words and independent fades persist in M3U and reject invalid duration
   assert.equal(clean.cues[0].cueText, "GO NOW");
   assert.equal(clean.cues[0].fadeIn, 1.25);
   assert.equal(clean.cues[0].fadeOut, 2.34);
-  for (const field of ["fadeIn", "fadeOut"])
+  assert.equal(clean.cues[0].fadeOutAtPause, 0.75);
+  // Older cues with an end fade do not implicitly acquire a pause fade.
+  const existing = validateSequence(
+    { ...seq, cues: [{ ...seq.cues[0], fadeOut: 2.34 }] },
+    media,
+  ).cues[0];
+  assert.equal(existing.fadeOut, 2.34);
+  assert.equal(existing.fadeOutAtPause, 0);
+  for (const field of ["fadeIn", "fadeOut", "fadeOutAtPause"])
     for (const n of [-1, Infinity, 3601, "bad"])
       assert.throws(
         () =>
